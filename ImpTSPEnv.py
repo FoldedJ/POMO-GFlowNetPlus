@@ -12,8 +12,8 @@ class ImproveState:
     """
     current_tour: torch.Tensor  # 当前完整路径，shape: (batch, problem)
     path_length: torch.Tensor   # 当前路径长度，shape: (batch,)
-    step_count: int             # 当前已执行的步数
-    done: bool                  # 标志，表示当前剧集是否结束
+    step_count: torch.Tensor             # 当前已执行的步数
+    done: torch.Tensor                  # 标志，表示当前剧集是否结束，shape: (batch,)
 
 
 class TSPEnv_Improve:
@@ -21,10 +21,11 @@ class TSPEnv_Improve:
     TSP改进环境类。
     该环境用于模拟TSP问题的路径改进过程，支持回溯-重构操作。
     """
-    def __init__(self, **env_params):
+    def __init__(self, device, **env_params):
         """
         初始化TSP改进环境。
         Args:
+            device (torch.device): 运行环境的设备 (CPU或CUDA)。
             env_params (dict): 环境参数，包括 'problem_size' 和可选的 'max_steps'。
         """
         self.env_params = env_params
@@ -33,6 +34,11 @@ class TSPEnv_Improve:
         self.max_steps = env_params.get('max_steps', self.problem_size * 2)
         self.batch_size = None  # 批处理大小
         self.problems = None    # 存储TSP问题实例，shape: (batch, problem, 2)
+        self.device = device    # 设备 (CPU或CUDA)
+
+    def __call__(self, problems):
+        self.batch_size = problems.shape[0]
+        self.problems = problems
 
     ###################################################################
     # 初始化问题数据
@@ -49,20 +55,22 @@ class TSPEnv_Improve:
     ###################################################################
     # 环境RESET：生成初始解
     ###################################################################
-    def reset(self, initial_method="random"):
+    def reset(self, problems, initial_method="random"):
         """
         重置环境，生成一个初始的TSP路径。
         Args:
+            problems (torch.Tensor): TSP问题实例，shape: (batch, problem, 2)。
             initial_method (str): 初始路径的生成方法，目前只支持 "random"。
         Returns:
             ImproveState: 包含初始路径、路径长度、步数和结束标志的状态对象。
         Raises:
             NotImplementedError: 如果使用了不支持的初始化方法。
         """
+        self(problems) # Store problems and batch_size
         # 随机生成一条路径
         if initial_method == "random":
             initial_tour = torch.stack([
-                torch.randperm(self.problem_size) for _ in range(self.batch_size)
+                torch.randperm(self.problem_size, device=problems.device) for _ in range(self.batch_size)
             ])
         else:
             raise NotImplementedError
@@ -72,8 +80,8 @@ class TSPEnv_Improve:
         state = ImproveState(
             current_tour=initial_tour,
             path_length=path_length,
-            step_count=0,
-            done=False
+            step_count=torch.zeros(self.batch_size, dtype=torch.long, device=self.device),
+            done=torch.full((self.batch_size,), False, device=problems.device, dtype=torch.bool)
         )
 
         return state
@@ -109,7 +117,7 @@ class TSPEnv_Improve:
 
         # 4. 检查终止条件
         # 当达到最大步数时，剧集结束
-        done = (new_step_count >= self.max_steps) # 或者其他终止条件
+        done = (new_step_count >= self.max_steps)
 
         next_state = ImproveState(
             current_tour=new_tour,
@@ -186,31 +194,31 @@ class TSPEnv_Improve:
         new_tours_list = []
 
         for b in range(batch_size):
-            # For each item in the batch
+            # 遍历批次中的每个样本
             current_tour_b = current_tour[b] # (problem,)
-            city_to_insert_b = city_to_insert[b] # scalar
+            city_to_insert_b = city_to_insert[b] # 标量
             edge_to_insert_b = edge_to_insert[b] # (2,)
 
-            # 1. Remove city_to_insert_b from current_tour_b
-            # Find the index of city_to_insert_b in current_tour_b
+            # 1. 从 current_tour_b 中移除待插入城市 city_to_insert_b
+            # 找到 city_to_insert_b 在 current_tour_b 中的索引
             remove_idx_b = (current_tour_b == city_to_insert_b).nonzero(as_tuple=True)[0].item()
 
-            # Create tour_without_city_b
+            # 创建移除城市后的路径 tour_without_city_b
             tour_without_city_b = torch.cat([
                 current_tour_b[:remove_idx_b],
                 current_tour_b[remove_idx_b+1:]
             ]) # (problem - 1,)
 
-            # 2. Find insertion position
-            # Find the index of edge_to_insert_b[0] in tour_without_city_b
-            # The insertion happens AFTER this node.
+            # 2. 找到插入位置
+            # 找到 edge_to_insert_b[0] 在 tour_without_city_b 中的索引
+            # 插入操作发生在该节点之后
             insert_node_idx_in_tour_without_city_b = (tour_without_city_b == edge_to_insert_b[0]).nonzero(as_tuple=True)[0].item()
-            insert_position_b = insert_node_idx_in_tour_without_city_b + 1 # Insert after the node
+            insert_position_b = insert_node_idx_in_tour_without_city_b + 1 # 在该节点之后插入
 
-            # 3. Insert city_to_insert_b into tour_without_city_b
+            # 3. 将 city_to_insert_b 插入到 tour_without_city_b 中
             new_tour_b = torch.cat([
                 tour_without_city_b[:insert_position_b],
-                city_to_insert_b.unsqueeze(0), # Make it a 1-element tensor to concatenate
+                city_to_insert_b.unsqueeze(0), # 将其转换为一个单元素张量以便拼接
                 tour_without_city_b[insert_position_b:]
             ]) # (problem,)
             new_tours_list.append(new_tour_b)

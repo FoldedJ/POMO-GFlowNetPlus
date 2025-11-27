@@ -6,7 +6,7 @@ import torch.nn.functional as F
 # 辅助函数和模块 (从TSPModel.py复制)
 
 def reshape_by_heads(qkv, head_num):
-    # q.shape: (batch, n, head_num*key_dim)   : n can be either 1 or PROBLEM_SIZE
+    # q.shape: (batch, n, head_num*key_dim)   : n 可以是 1 或 PROBLEM_SIZE
 
     batch_s = qkv.size(0)
     n = qkv.size(1)
@@ -21,7 +21,7 @@ def reshape_by_heads(qkv, head_num):
 
 
 def multi_head_attention(q, k, v, rank2_ninf_mask=None, rank3_ninf_mask=None):
-    # q shape: (batch, head_num, n, key_dim)   : n can be either 1 or PROBLEM_SIZE
+    # q shape: (batch, head_num, n, key_dim)   : n 可以是 1 或 PROBLEM_SIZE
     # k,v shape: (batch, head_num, problem, key_dim)
     # rank2_ninf_mask.shape: (batch, problem)
     # rank3_ninf_mask.shape: (batch, group, problem)
@@ -247,14 +247,14 @@ class ReconstructionPolicyNetwork(nn.Module):
         self.encoder = encoder  # 共享编码器
         embedding_dim = self.model_params['embedding_dim']
 
-        # Head for selecting city_to_insert
+        # Head for selecting city_to_insert (选择要插入的城市)
         self.city_selection_head = nn.Sequential(
             nn.Linear(embedding_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 1) # Output a score for each city
         )
 
-        # Head for selecting edge_to_insert (by selecting the first node of the edge)
+        # Head for selecting edge_to_insert (通过选择边的第一个节点来选择要插入的边)
         self.edge_selection_head = nn.Sequential(
             nn.Linear(embedding_dim, 64),
             nn.ReLU(),
@@ -267,17 +267,17 @@ class ReconstructionPolicyNetwork(nn.Module):
 
         city_embeddings = self.encoder(city_coordinates)  # shape: (batch, problem, embedding)
 
-        # Predict probabilities for city_to_insert
+        # Predict probabilities for city_to_insert (预测要插入的城市的概率)
         city_logits = self.city_selection_head(city_embeddings).squeeze(-1) # shape: (batch, problem)
         city_to_insert_probs = F.softmax(city_logits, dim=-1)
 
-        # Predict probabilities for edge_to_insert
-        # We need embeddings of nodes in the current_tour to predict edges
-        # For simplicity, let's use the city_embeddings directly and assume we are selecting a node
-        # that *starts* an edge in the current tour.
-        # The actual edge will be (selected_node, next_node_in_tour)
+        # Predict probabilities for edge_to_insert (预测要插入的边的概率)
+        # We need embeddings of nodes in the current_tour to predict edges (我们需要当前路径中节点的嵌入来预测边)
+        # For simplicity, let's use the city_embeddings directly and assume we are selecting a node (为简化起见，我们直接使用城市嵌入，并假设我们正在选择一个节点)
+        # that *starts* an edge in the current tour. (该节点是当前路径中某条边的起始点。)
+        # The actual edge will be (selected_node, next_node_in_tour) (实际的边将是 (selected_node, next_node_in_tour))
 
-        # To get embeddings of nodes in current_tour:
+        # To get embeddings of nodes in current_tour: (获取当前路径中节点的嵌入:)
         batch_size, problem_size, embedding_dim = city_embeddings.shape
         gathering_index = current_tour.unsqueeze(2).expand(batch_size, problem_size, embedding_dim)
         tour_node_embeddings = city_embeddings.gather(dim=1, index=gathering_index) # shape: (batch, problem, embedding)
@@ -303,7 +303,7 @@ class GFlowNetTSPModel(nn.Module):
         # 回溯策略网络
         self.backtrack_policy_network = BacktrackPolicyNetwork(self.encoder, **model_params)
 
-        # 重构策略网络
+        # 重构策略网络（基于POMO解码器）
         self.reconstruction_policy_network = ReconstructionPolicyNetwork(self.encoder, **model_params)
 
     def forward(self, city_coordinates, current_tour):
