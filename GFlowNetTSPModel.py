@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
+from typing import Optional, Sequence
+
+from TSPModel import TSP_Decoder
 
 
 # 辅助函数和模块 (从TSPModel.py复制)
@@ -321,6 +325,7 @@ class GFlowNetTSPModel(nn.Module):
 
         # 共享编码器
         self.encoder = TSP_Encoder(**model_params)
+        self.decoder = TSP_Decoder(**model_params)
 
         # 价值网络
         self.value_network = ValueNetwork(self.encoder, **model_params)
@@ -330,6 +335,220 @@ class GFlowNetTSPModel(nn.Module):
 
         # 重构策略网络（基于POMO解码器）
         self.reconstruction_policy_network = ReconstructionPolicyNetwork(self.encoder, **model_params)
+
+        hidden_dim = model_params.get('backtrack_value_hidden_dim', 64)
+        self.backtrack_value_head = nn.Sequential(
+            nn.Linear(model_params['embedding_dim'], hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    # TODO: 根据训练反馈调优回溯分数的估计模块
+    def compute_backtrack_scores(
+        self,
+        problems: Tensor,
+        tours: Tensor,
+        node_embeddings: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        计算批次中每条路径各位置的回溯分数 φ(i)，其中 φ(i)=前缀真实路程−预测剩余路程。
+
+        Args:
+            problems: 城市坐标张量，形状为 (batch, N, 2)。
+            tours: 城市访问序列，形状为 (batch, N)。
+
+        Returns:
+            张量形状为 (batch, N)，为每个前缀位置的回溯分数。
+        """
+        # 获取节点嵌入并按路径顺序排列
+        if node_embeddings is None:
+            node_embeddings = self.encoder(problems)  # (batch, N, embedding)
+        embedding_idx = tours.unsqueeze(-1).expand(-1, -1, node_embeddings.size(-1))
+        tour_embeddings = node_embeddings.gather(dim=1, index=embedding_idx)
+
+        # 预测剩余成本（不截断梯度以保持可微分）
+        predicted_remaining = self.backtrack_value_head(tour_embeddings).squeeze(-1)
+
+        # 计算路径前缀的真实旅行成本
+        coord_idx = tours.unsqueeze(-1).expand(-1, -1, problems.size(-1))
+        ordered_coords = problems.gather(dim=1, index=coord_idx)
+        step_vectors = ordered_coords[:, 1:, :] - ordered_coords[:, :-1, :]
+        step_cost = torch.norm(step_vectors, dim=-1)
+        prefix_cost = torch.cat(
+            [
+                torch.zeros(step_cost.size(0), 1, device=problems.device, dtype=problems.dtype),
+                torch.cumsum(step_cost, dim=1),
+            ],
+            dim=1,
+        )
+
+        return prefix_cost - predicted_remaining
+
+    def reconstruct_from_prefix(
+        self,
+        problems: Tensor,
+        prefixes: Sequence[Sequence[int]],
+        num_samples: int,
+        greedy: bool = False,
+        node_embeddings: Optional[Tensor] = None,
+        return_log_prob: bool = False,
+    ) -> Tensor:
+        """
+        利用POMO解码器在给定路径前缀下生成多条完整候选路径。
+
+        Args:
+            problems: 城市坐标，形状 (batch, N, 2)。
+            prefixes: 每个batch样本对应的前缀序列（至少1个节点）。
+            num_samples: 为每个前缀生成的候选条数 m。
+            greedy: True时使用贪心解码，否则按概率随机采样。
+            node_embeddings: 可选的城市嵌入 (batch, N, embedding)，减少重复编码。
+
+        Returns:
+            Tensor: 形状 (batch, m, N) 的完整TSP路径集合。
+        """
+        if problems.dim() != 3:
+            raise ValueError("problems 张量形状必须为 (batch, N, 2)")
+        batch_size, problem_size, _ = problems.shape
+        if len(prefixes) != batch_size:
+            raise ValueError("prefixes 的长度必须等于 batch size")
+        if num_samples <= 0:
+            raise ValueError("num_samples 必须为正整数")
+
+        device = problems.device
+        if node_embeddings is None:
+            node_embeddings = self.encoder(problems)
+        embedding_dim = node_embeddings.size(-1)
+
+        pomo_size = num_samples
+        tours = torch.full(
+            (batch_size, pomo_size, problem_size),
+            fill_value=-1,
+            dtype=torch.long,
+            device=device,
+        )
+        visited_mask = torch.zeros(
+            (batch_size, pomo_size, problem_size), dtype=torch.bool, device=device
+        )
+        steps_filled = torch.zeros(
+            (batch_size, pomo_size), dtype=torch.long, device=device
+        )
+        current_node = torch.zeros(
+            (batch_size, pomo_size), dtype=torch.long, device=device
+        )
+        first_nodes = torch.zeros(
+            (batch_size, pomo_size), dtype=torch.long, device=device
+        )
+
+        for batch_idx, prefix in enumerate(prefixes):
+            if len(prefix) == 0:
+                raise ValueError("每个前缀至少包含1个城市")
+            prefix_tensor = torch.as_tensor(prefix, dtype=torch.long, device=device)
+            if prefix_tensor.numel() > problem_size:
+                raise ValueError("前缀长度不能超过问题规模")
+
+            seq_len = prefix_tensor.numel()
+            tours[batch_idx, :, :seq_len] = prefix_tensor
+            visited_mask[batch_idx, :, prefix_tensor] = True
+            steps_filled[batch_idx, :] = seq_len
+            current_node[batch_idx, :] = prefix_tensor[-1]
+            first_nodes[batch_idx, :] = prefix_tensor[0]
+
+        # 使用共享编码器+POMO解码器进行自回归采样
+        self.decoder.set_kv(node_embeddings)
+        batch_arange = torch.arange(batch_size, device=device).unsqueeze(1).expand(
+            batch_size, pomo_size
+        )
+        first_embeddings = node_embeddings[batch_arange, first_nodes]
+        self.decoder.set_q1(first_embeddings)
+
+        tours_flat = tours.view(batch_size * pomo_size, problem_size)
+        visited_flat = visited_mask.view(batch_size * pomo_size, problem_size)
+        steps_flat = steps_filled.view(-1)
+        current_flat = current_node.view(-1)
+        if return_log_prob:
+            log_prob_accum = torch.zeros(
+                batch_size * pomo_size, dtype=problems.dtype, device=device
+            )
+
+        for _ in range(problem_size):
+            # 自回归地对所有候选同时采样一个新城市，mask保证不会重复访问
+            active = steps_flat < problem_size
+            if not torch.any(active):
+                break
+
+            mask = visited_mask & active.view(batch_size, pomo_size, 1)
+            ninf_mask = torch.zeros(
+                (batch_size, pomo_size, problem_size),
+                dtype=node_embeddings.dtype,
+                device=device,
+            )
+            ninf_mask.masked_fill_(mask, float("-inf"))
+
+            encoded_last = node_embeddings[batch_arange, current_node]
+            probs = self.decoder(encoded_last, ninf_mask)
+            probs_flat = probs.view(batch_size * pomo_size, problem_size)
+
+            active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+            if active_idx.numel() == 0:
+                break
+
+            if greedy:
+                picked = probs_flat[active_idx].argmax(dim=-1)
+            else:
+                picked = torch.multinomial(probs_flat[active_idx], num_samples=1).squeeze(-1)
+
+            if return_log_prob:
+                chosen_prob = probs_flat[active_idx, picked].clamp_min(1e-9)
+                log_prob_accum[active_idx] += torch.log(chosen_prob)
+
+            tours_flat[active_idx, steps_flat[active_idx]] = picked
+            visited_flat[active_idx, picked] = True
+            current_flat[active_idx] = picked
+            steps_flat[active_idx] += 1
+
+        if (tours_flat == -1).any():
+            raise RuntimeError("存在未完成的路径，检查前缀或采样逻辑是否正确")
+
+        if return_log_prob:
+            return tours, log_prob_accum.view(batch_size, pomo_size)
+        return tours
+
+    def sample_candidates(
+        self,
+        problems: Tensor,
+        tours: Tensor,
+        topk: int,
+        num_reconstructions: int,
+        greedy: bool = False,
+    ) -> Tensor:
+        """
+        计算回溯分数，挑选Top-K前缀，并调用重构函数扩充候选路径。
+        """
+        if topk <= 0 or num_reconstructions <= 0:
+            raise ValueError("topk 与 num_reconstructions 必须为正整数")
+
+        scores = self.compute_backtrack_scores(problems, tours)
+        k = min(topk, scores.size(1))
+        _, indices = torch.topk(scores, k=k, dim=1)
+
+        node_embeddings = self.encoder(problems)
+        candidates = []
+        for rank in range(k):
+            prefix_ends = indices[:, rank]
+            prefixes = [
+                tours[batch_idx, : end_idx.item() + 1].tolist()
+                for batch_idx, end_idx in enumerate(prefix_ends)
+            ]
+            rebuilt = self.reconstruct_from_prefix(
+                problems,
+                prefixes,
+                num_reconstructions,
+                greedy=greedy,
+                node_embeddings=node_embeddings,
+            )
+            candidates.append(rebuilt.unsqueeze(1))
+
+        return torch.cat(candidates, dim=1)
 
     def forward(self, city_coordinates, current_tour):
         # city_coordinates: (batch, problem, 2)

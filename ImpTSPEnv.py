@@ -1,15 +1,21 @@
 from dataclasses import dataclass
+import logging
 import torch
 
 from TSProblemDef import get_random_problems
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ImproveState:
     current_tour: torch.Tensor  # 当前完整路径，shape: (batch, problem)
-    path_length: torch.Tensor   # 当前路径长度
-    step_count: torch.Tensor             # 当前已执行的步数 ？ 为什么要记录步数###############################
-    done: torch.Tensor                  # 标志，表示当前episode是否结束
+    path_length: torch.Tensor   # 最佳路径长度
+    step_count: torch.Tensor    # 当前已执行的改进次数
+    done: torch.Tensor          # 标志，表示每个实例是否结束
+    best_tour: torch.Tensor
+    best_length: torch.Tensor
+    no_improve: torch.Tensor
 
 
 class TSPEnv_Improve:
@@ -22,6 +28,7 @@ class TSPEnv_Improve:
         self.batch_size = None  
         self.problems = None    # shape: (batch, problem, 2)
         self.device = device
+        self.patience = env_params.get('patience', 5)
 
     def __call__(self, problems):
         self.batch_size = problems.shape[0]
@@ -59,40 +66,70 @@ class TSPEnv_Improve:
 
         path_length = self._get_tour_length(initial_tour)
 
+        zeros = torch.zeros(self.batch_size, dtype=torch.long, device=self.device)
         state = ImproveState(
             current_tour=initial_tour,
-            path_length=path_length,
-            step_count=torch.zeros(self.batch_size, dtype=torch.long, device=self.device),
-            done=torch.full((self.batch_size,), False, device=problems.device, dtype=torch.bool)
+            path_length=path_length.clone(),
+            step_count=zeros.clone(),
+            done=torch.full((self.batch_size,), False, device=problems.device, dtype=torch.bool),
+            best_tour=initial_tour.clone(),
+            best_length=path_length.clone(),
+            no_improve=zeros.clone()
         )
 
         return state
 
     def step(self, state: ImproveState, backtrack_point, city_to_insert, edge_to_insert):
         old_tour = state.current_tour
-        old_length = state.path_length
         old_step_count = state.step_count
+        active_mask = ~state.done
 
-        # 1. 重构路径
-        new_tour = self._reconstruct_tour(old_tour, backtrack_point, city_to_insert, edge_to_insert)
+        safe_bt = backtrack_point.clone()
+        safe_ct = city_to_insert.clone()
+        safe_edge = edge_to_insert.clone()
+        inactive_idx = torch.nonzero(~active_mask, as_tuple=False).flatten()
+        if inactive_idx.numel() > 0:
+            safe_bt[inactive_idx] = state.best_tour[inactive_idx, 0]
+            safe_ct[inactive_idx] = state.best_tour[inactive_idx, 0]
+            safe_edge[inactive_idx] = state.best_tour[inactive_idx][:, :2]
+
+        if active_mask.any():
+            rebuilt = self._reconstruct_tour(old_tour, safe_bt, safe_ct, safe_edge)
+        else:
+            rebuilt = state.best_tour.clone()
+
+        new_tour = torch.where(active_mask.unsqueeze(1), rebuilt, state.best_tour)
         new_length = self._get_tour_length(new_tour)
+        candidate_length = torch.where(active_mask, new_length, state.best_length)
+        better_mask = candidate_length < state.best_length
+        updated_best_tour = torch.where(better_mask.unsqueeze(1), new_tour, state.best_tour)
+        updated_best_length = torch.where(better_mask, candidate_length, state.best_length)
 
-        # 2. 计算奖励
-        # 奖励为路径质量奖励：R(pi) = exp(-eta * L(pi))
-        reward = torch.exp(-self.eta * new_length)
+        no_improve = state.no_improve.clone()
+        improve_idx = active_mask & better_mask
+        stagnate_idx = active_mask & (~better_mask)
+        no_improve[improve_idx] = 0
+        no_improve[stagnate_idx] += 1
 
-        # 3. 更新步数
-        new_step_count = old_step_count + 1
+        reward = torch.exp(-self.eta * updated_best_length)
+        new_step_count = torch.where(active_mask, old_step_count + 1, old_step_count)
 
-        # 4. 检查终止条件
-        # 当达到最大步数时，剧集结束
-        done = (new_step_count >= self.max_steps)
+        patience_hit = no_improve >= self.patience
+        done = patience_hit
+        newly_finished = (~state.done) & done
+        if newly_finished.any():
+            for b in torch.nonzero(newly_finished, as_tuple=False).flatten():
+                steps = new_step_count[b].item()
+                logger.debug(f"[STOP] batch={b.item()}, converged after {steps} improvement steps.")
 
         next_state = ImproveState(
-            current_tour=new_tour,
-            path_length=new_length,
+            current_tour=updated_best_tour.clone(),
+            path_length=updated_best_length.clone(),
             step_count=new_step_count,
-            done=done
+            done=done,
+            best_tour=updated_best_tour.clone(),
+            best_length=updated_best_length.clone(),
+            no_improve=no_improve
         )
 
         return next_state, reward, done
@@ -100,29 +137,43 @@ class TSPEnv_Improve:
     ###################################################################
     # 计算路径长度
     ###################################################################
-    def _get_tour_length(self, tour):
+    def compute_tour_lengths(self, tours: torch.Tensor) -> torch.Tensor:
         """
-        计算给定TSP路径的总长度。
+        计算单条或多条候选路径的总长度，自动适配 (batch, N) 或 (batch, C, N)。
         Args:
-            tour (torch.Tensor): TSP路径，shape: (batch, problem)。
+            tours: 路径索引张量，最后一维长度等于问题规模。
         Returns:
-            torch.Tensor: 路径的总长度，shape: (batch,)。
+            torch.Tensor: 若输入为 (batch, N) 则输出 (batch,)，否则输出 (batch, C)。
         """
-        batch = self.batch_size
-        problem = self.problem_size
+        if self.problems is None:
+            raise ValueError("请先调用 reset() 或显式设置 self.problems。")
+        if tours.dim() not in (2, 3):
+            raise ValueError("tours 的形状必须为 (batch, N) 或 (batch, C, N)。")
 
-        # 获取路径节点坐标
-        # 将路径中的城市索引转换为实际的城市坐标
-        idx = tour.unsqueeze(2).expand(batch, problem, 2)
-        ordered_seq = self.problems.gather(dim=1, index=idx)
+        single_tour = tours.dim() == 2
+        if single_tour:
+            tours = tours.unsqueeze(1)  # (batch, 1, N)
 
-        # 将路径首尾相连，形成一个环
-        rolled_seq = ordered_seq.roll(dims=1, shifts=-1)
-        # 计算每段路径的长度 (欧几里得距离)
-        segment_lengths = ((ordered_seq - rolled_seq) ** 2).sum(2).sqrt()
+        batch_size, candidate_size, seq_len = tours.shape
+        if seq_len != self.problem_size:
+            raise ValueError("路径长度必须与 problem_size 一致。")
 
-        # 返回所有段长度的总和
-        return segment_lengths.sum(1)
+        problems = self.problems.unsqueeze(1).expand(batch_size, candidate_size, seq_len, 2)
+        gather_idx = tours.unsqueeze(-1).expand(-1, -1, -1, 2)
+        ordered_seq = problems.gather(dim=2, index=gather_idx)
+
+        # 将路径首尾相连，批量计算每段欧几里得距离
+        rolled_seq = ordered_seq.roll(dims=2, shifts=-1)
+        segment_lengths = torch.norm(ordered_seq - rolled_seq, dim=-1)
+        tour_lengths = segment_lengths.sum(dim=2)
+
+        return tour_lengths.squeeze(1) if single_tour else tour_lengths
+
+    def _get_tour_length(self, tour: torch.Tensor) -> torch.Tensor:
+        """
+        兼容旧接口，内部调用 compute_tour_lengths。
+        """
+        return self.compute_tour_lengths(tour)
 
     def _reconstruct_tour(self, current_tour, backtrack_point, city_to_insert, edge_to_insert):
         """
