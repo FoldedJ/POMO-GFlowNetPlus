@@ -3,3 +3,11 @@ result/
 __pycache__/
 logs/train.log
 /checkpoints
+test_n100.py
+test_n20.py
+train_n100.py
+train_n20.py
+TSPEnv.py
+TSPModel.py
+TSPTester.py
+TSPTrainer.py
