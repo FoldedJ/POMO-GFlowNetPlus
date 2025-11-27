@@ -1,10 +1,7 @@
 import logging
 import os
-from typing import Dict
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 
@@ -39,6 +36,8 @@ class GFlowNetTBTrainer:
         temp_min: float,
         temp_decay: float,
         patience: int,
+        candidate_topk: int = 3,
+        samples_per_prefix: int = 2,
     ) -> None:
         if max_steps is None:
             max_steps = problem_size * 2
@@ -55,6 +54,8 @@ class GFlowNetTBTrainer:
         self.temp_min = temp_min
         self.temp_decay = temp_decay
         self.patience = patience
+        self.candidate_topk = candidate_topk
+        self.samples_per_prefix = samples_per_prefix
 
         os.makedirs(log_dir, exist_ok=True)
         logging.basicConfig(
@@ -89,69 +90,9 @@ class GFlowNetTBTrainer:
         self.log_z = nn.Parameter(torch.zeros(1, device=self.device))
         self.trainable_params = list(self.model.parameters()) + [self.log_z]
         self.optimizer = optim.Adam(self.trainable_params, lr=lr)
-        self.optimizer.generate_improvements = lambda problems, temperature: self._generate_improvements(
-            problems, temperature
-        )
-
-        self.last_metadata: Dict[str, torch.Tensor] | None = None
 
     def _temperature(self, epoch: int) -> float:
         return max(self.temp_min, self.temp_start * (self.temp_decay ** epoch))
-
-    def _generate_improvements(self, problems: torch.Tensor, temperature: float) -> Dict[str, torch.Tensor]:
-        """
-        运行单次episode并返回TB所需的轨迹统计量。
-        """
-        state = self.env.reset(problems)
-        current_tours = state.current_tour
-        base_lengths = state.path_length
-
-        node_embeddings = self.model.encoder(problems)
-        prefix_scores = self.model.compute_backtrack_scores(
-            problems, current_tours, node_embeddings=node_embeddings
-        )
-        scaled_scores = prefix_scores / max(temperature, 1e-6)
-        log_prefix_probs = F.log_softmax(scaled_scores, dim=-1)
-        prefix_probs = log_prefix_probs.exp()
-        prefix_index = torch.multinomial(prefix_probs, 1).squeeze(-1)
-        log_pf_prefix = log_prefix_probs.gather(1, prefix_index.unsqueeze(-1)).squeeze(-1)
-
-        prefixes = [
-            current_tours[b, : prefix_index[b].item() + 1].tolist()
-            for b in range(current_tours.size(0))
-        ]
-
-        rebuilt, log_completion = self.model.reconstruct_from_prefix(
-            problems,
-            prefixes,
-            num_samples=1,
-            greedy=False,
-            node_embeddings=node_embeddings,
-            return_log_prob=True,
-        )
-        rebuilt = rebuilt.squeeze(1)
-        log_completion = log_completion.squeeze(1)
-        log_pf = log_pf_prefix + log_completion
-
-        child_scores = self.model.compute_backtrack_scores(
-            problems, rebuilt, node_embeddings=node_embeddings
-        )
-        scaled_child = child_scores / max(temperature, 1e-6)
-        log_pb = F.log_softmax(scaled_child, dim=-1).gather(
-            1, prefix_index.unsqueeze(-1)
-        ).squeeze(-1)
-
-        new_lengths = self.env.compute_tour_lengths(rebuilt)
-        reward = -new_lengths * self.scaling_factor
-        improved = (new_lengths < base_lengths).to(torch.float32)
-
-        self.last_metadata = {
-            "prefix_index": prefix_index.detach().cpu(),
-            "final_tour": rebuilt.detach().cpu(),
-            "improved": improved.detach().cpu(),
-        }
-
-        return {"log_pf": log_pf, "log_pb": log_pb, "reward": reward}
 
     def train_loop(self) -> None:
         self.model.train()
@@ -162,11 +103,18 @@ class GFlowNetTBTrainer:
             problems = augment_xy_data_by_8_fold(problems)
             temperature = self._temperature(epoch)
 
-            # TB workflow: episode -> optimizer.generate_improvements() -> collect trajectory -> compute log_pf/log_pb -> TB loss -> backward -> optimizer step
-            trajectory = self.optimizer.generate_improvements(problems, temperature)
-            log_pf = trajectory["log_pf"]
-            log_pb = trajectory["log_pb"]
-            reward = trajectory["reward"]
+            # TB workflow: episode -> optimizer.optimize_episode() -> collect trajectory -> compute log_pf/log_pb -> TB loss -> backward -> optimizer step
+            state = self.env.reset(problems)
+            trajectory = self.env.optimize_episode(
+                model=self.model,
+                current_tour=state.current_tour,
+                topk=self.candidate_topk,
+                num_samples=self.samples_per_prefix,
+                greedy=False,
+            )
+            log_pf = trajectory.log_pf
+            log_pb = trajectory.log_pb
+            reward = trajectory.reward
 
             loss = (self.log_z + log_pf - log_pb - reward).pow(2).mean()
             if torch.isnan(loss):
@@ -179,11 +127,8 @@ class GFlowNetTBTrainer:
             clip_grad_norm_(self.trainable_params, self.grad_clip)
             self.optimizer.step()
 
-            improve_rate = (
-                self.last_metadata["improved"].mean().item() if self.last_metadata else 0.0
-            )
             logging.info(
-                "Epoch %d/%d | Loss %.4f | log_pf %.4f | log_pb %.4f | reward %.4f | temp %.3f | improve_rate %.3f",
+                "Epoch %d/%d | Loss %.4f | log_pf %.4f | log_pb %.4f | reward %.4f | temp %.3f",
                 epoch + 1,
                 self.epochs,
                 loss.item(),
@@ -191,7 +136,6 @@ class GFlowNetTBTrainer:
                 log_pb.mean().item(),
                 reward.mean().item(),
                 temperature,
-                improve_rate,
             )
 
             if (epoch + 1) % self.eval_interval == 0:
@@ -203,6 +147,13 @@ class GFlowNetTBTrainer:
                 save_model(self.model, self.optimizer, self.log_z, epoch, checkpoint_path)
 
         logging.info("训练完成！")
+
+        # 旧版POMO强化学习训练逻辑（保留以备参考）
+        """
+        legacy_state = self.env.reset(problems)
+        # 旧逻辑：调用GFlowNetAgent.run_episode收集轨迹后，分别计算value/policy consistency等损失。
+        # 该段代码已被轨迹平衡训练替换，如需回退可在此处接入旧的训练流程。
+        """
 
 
 def evaluate(model: GFlowNetTSPModel, problem_size: int, device: torch.device, num_problems: int = 100) -> float:

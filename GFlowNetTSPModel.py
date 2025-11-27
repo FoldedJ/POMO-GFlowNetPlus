@@ -351,43 +351,46 @@ class GFlowNetTSPModel(nn.Module):
         node_embeddings: Optional[Tensor] = None,
     ) -> Tensor:
         """
-        计算批次中每条路径各位置的回溯分数 φ(i)，其中 φ(i)=前缀真实路程−预测剩余路程。
-
-        Args:
-            problems: 城市坐标张量，形状为 (batch, N, 2)。
-            tours: 城市访问序列，形状为 (batch, N)。
-
-        Returns:
-            张量形状为 (batch, N)，为每个前缀位置的回溯分数。
+        计算每个前缀的回溯分数 φ(i)=前缀真实路程−预测剩余路程。
         """
-        # 获取节点嵌入并按路径顺序排列
         if node_embeddings is None:
-            node_embeddings = self.encoder(problems)  # (batch, N, embedding)
-        embedding_idx = tours.unsqueeze(-1).expand(-1, -1, node_embeddings.size(-1))
-        tour_embeddings = node_embeddings.gather(dim=1, index=embedding_idx)
+            node_embeddings = self.encoder(problems)
 
-        # 预测剩余成本（不截断梯度以保持可微分）
-        predicted_remaining = self.backtrack_value_head(tour_embeddings).squeeze(-1)
+        # 按路径顺序排列节点坐标与嵌入
+        gather_idx_coords = tours.unsqueeze(-1).expand(-1, -1, problems.size(-1))
+        ordered_coords = problems.gather(dim=1, index=gather_idx_coords)
 
-        # 计算路径前缀的真实旅行成本
-        coord_idx = tours.unsqueeze(-1).expand(-1, -1, problems.size(-1))
-        ordered_coords = problems.gather(dim=1, index=coord_idx)
+        embed_dim = node_embeddings.size(-1)
+        gather_idx_embed = tours.unsqueeze(-1).expand(-1, -1, embed_dim)
+        tour_embeddings = node_embeddings.gather(dim=1, index=gather_idx_embed)
+
+        # 计算前缀真实路程（矢量化欧氏距离）
         step_vectors = ordered_coords[:, 1:, :] - ordered_coords[:, :-1, :]
         step_cost = torch.norm(step_vectors, dim=-1)
+        prefix_cost = torch.cumsum(step_cost, dim=1)
         prefix_cost = torch.cat(
             [
                 torch.zeros(step_cost.size(0), 1, device=problems.device, dtype=problems.dtype),
-                torch.cumsum(step_cost, dim=1),
+                prefix_cost,
             ],
             dim=1,
         )
 
-        return prefix_cost - predicted_remaining
+        # 使用轻量 value head 预测剩余路程
+        predicted_remaining = self.backtrack_value_head(tour_embeddings).squeeze(-1)
+
+        scores = prefix_cost - predicted_remaining
+        # TODO scale φ(i) for stability if training diverges
+        temperature = self.model_params.get("phi_temperature")
+        if temperature is not None and temperature > 0:
+            scores = scores / temperature
+
+        return scores
 
     def reconstruct_from_prefix(
         self,
         problems: Tensor,
-        prefixes: Sequence[Sequence[int]],
+        prefixes: Sequence[Sequence[Sequence[int]] | Sequence[int]],
         num_samples: int,
         greedy: bool = False,
         node_embeddings: Optional[Tensor] = None,
@@ -398,13 +401,13 @@ class GFlowNetTSPModel(nn.Module):
 
         Args:
             problems: 城市坐标，形状 (batch, N, 2)。
-            prefixes: 每个batch样本对应的前缀序列（至少1个节点）。
-            num_samples: 为每个前缀生成的候选条数 m。
-            greedy: True时使用贪心解码，否则按概率随机采样。
-            node_embeddings: 可选的城市嵌入 (batch, N, embedding)，减少重复编码。
+            prefixes: 每个batch的前缀集合，长度可为K；若传入单条前缀则自动包装。
+            num_samples: 为每个前缀生成的候选条数 M。
+            greedy: True 时执行贪心解码，否则按概率采样。
+            node_embeddings: 可选节点嵌入，避免重复编码。
 
         Returns:
-            Tensor: 形状 (batch, m, N) 的完整TSP路径集合。
+            Tensor: 形状 (batch, K*M, N) 的完整TSP路径集合。
         """
         if problems.dim() != 3:
             raise ValueError("problems 张量形状必须为 (batch, N, 2)")
@@ -414,12 +417,43 @@ class GFlowNetTSPModel(nn.Module):
         if num_samples <= 0:
             raise ValueError("num_samples 必须为正整数")
 
+        # 将输入统一为 List[List[List[int]]]
+        normalized_prefixes: list[list[torch.Tensor]] = []
+        prefix_counts = []
         device = problems.device
+        for entry in prefixes:
+            if len(entry) == 0:
+                raise ValueError("每个batch至少需要一个前缀")
+
+            first_elem = entry[0] if isinstance(entry, Sequence) else entry
+            if isinstance(first_elem, (list, tuple, torch.Tensor)) and not isinstance(first_elem, (int, torch.Tensor)) or (
+                isinstance(first_elem, torch.Tensor) and first_elem.dim() > 0
+            ):
+                prefix_list = entry  # type: ignore
+            elif isinstance(entry[0], int):  # type: ignore
+                prefix_list = [entry]  # type: ignore
+            else:
+                prefix_list = entry  # type: ignore
+
+            tensor_list: list[torch.Tensor] = []
+            for seq in prefix_list:  # type: ignore
+                seq_tensor = torch.as_tensor(seq, dtype=torch.long, device=device)
+                if seq_tensor.numel() == 0:
+                    raise ValueError("前缀不能为空")
+                if seq_tensor.numel() > problem_size:
+                    raise ValueError("前缀长度不能超过问题规模")
+                tensor_list.append(seq_tensor)
+            normalized_prefixes.append(tensor_list)
+            prefix_counts.append(len(tensor_list))
+
+        if len(set(prefix_counts)) != 1:
+            raise ValueError("所有batch必须拥有相同数量的前缀以便并行采样")
+        prefix_per_batch = prefix_counts[0]
+        pomo_size = prefix_per_batch * num_samples
+
         if node_embeddings is None:
             node_embeddings = self.encoder(problems)
-        embedding_dim = node_embeddings.size(-1)
 
-        pomo_size = num_samples
         tours = torch.full(
             (batch_size, pomo_size, problem_size),
             fill_value=-1,
@@ -439,19 +473,16 @@ class GFlowNetTSPModel(nn.Module):
             (batch_size, pomo_size), dtype=torch.long, device=device
         )
 
-        for batch_idx, prefix in enumerate(prefixes):
-            if len(prefix) == 0:
-                raise ValueError("每个前缀至少包含1个城市")
-            prefix_tensor = torch.as_tensor(prefix, dtype=torch.long, device=device)
-            if prefix_tensor.numel() > problem_size:
-                raise ValueError("前缀长度不能超过问题规模")
-
-            seq_len = prefix_tensor.numel()
-            tours[batch_idx, :, :seq_len] = prefix_tensor
-            visited_mask[batch_idx, :, prefix_tensor] = True
-            steps_filled[batch_idx, :] = seq_len
-            current_node[batch_idx, :] = prefix_tensor[-1]
-            first_nodes[batch_idx, :] = prefix_tensor[0]
+        for batch_idx, prefix_list in enumerate(normalized_prefixes):
+            for prefix_idx, prefix_tensor in enumerate(prefix_list):
+                seq_len = prefix_tensor.numel()
+                start = prefix_idx * num_samples
+                end = start + num_samples
+                tours[batch_idx, start:end, :seq_len] = prefix_tensor
+                visited_mask[batch_idx, start:end, prefix_tensor] = True
+                steps_filled[batch_idx, start:end] = seq_len
+                current_node[batch_idx, start:end] = prefix_tensor[-1]
+                first_nodes[batch_idx, start:end] = prefix_tensor[0]
 
         # 使用共享编码器+POMO解码器进行自回归采样
         self.decoder.set_kv(node_embeddings)
@@ -471,7 +502,6 @@ class GFlowNetTSPModel(nn.Module):
             )
 
         for _ in range(problem_size):
-            # 自回归地对所有候选同时采样一个新城市，mask保证不会重复访问
             active = steps_flat < problem_size
             if not torch.any(active):
                 break
@@ -509,8 +539,10 @@ class GFlowNetTSPModel(nn.Module):
         if (tours_flat == -1).any():
             raise RuntimeError("存在未完成的路径，检查前缀或采样逻辑是否正确")
 
+        tours = tours.view(batch_size, pomo_size, problem_size)
         if return_log_prob:
-            return tours, log_prob_accum.view(batch_size, pomo_size)
+            log_probs = log_prob_accum.view(batch_size, pomo_size)
+            return tours, log_probs
         return tours
 
     def sample_candidates(

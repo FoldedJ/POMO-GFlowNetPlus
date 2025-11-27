@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 import logging
+from typing import List, Optional
+
 import torch
+import torch.nn.functional as F
 
 from TSProblemDef import get_random_problems
 
@@ -16,6 +19,16 @@ class ImproveState:
     best_tour: torch.Tensor
     best_length: torch.Tensor
     no_improve: torch.Tensor
+
+
+@dataclass
+class ImprovementTrajectory:
+    prefix_index: torch.Tensor
+    candidate_tours: torch.Tensor
+    final_tour: torch.Tensor
+    log_pf: torch.Tensor
+    log_pb: torch.Tensor
+    reward: torch.Tensor
 
 
 class TSPEnv_Improve:
@@ -133,6 +146,126 @@ class TSPEnv_Improve:
         )
 
         return next_state, reward, done
+
+    def optimize_episode(
+        self,
+        model,
+        current_tour: torch.Tensor,
+        topk: int = 3,
+        num_samples: int = 2,
+        greedy: bool = False,
+        patience: Optional[int] = None,
+    ) -> ImprovementTrajectory:
+        """
+        重复进行多次回溯与重构，直到所有实例连续无改进达到 patience，返回最后一次采样的轨迹。
+        """
+        if self.problems is None:
+            raise ValueError("请先调用 reset() 初始化问题实例")
+        if current_tour.shape != (self.batch_size, self.problem_size):
+            raise ValueError("current_tour 形状必须为 (batch, problem_size)")
+        if topk <= 0 or num_samples <= 0:
+            raise ValueError("topk 与 num_samples 必须为正整数")
+
+        patience = patience or self.patience
+        batch_size = self.batch_size
+        device = self.device
+
+        node_embeddings = model.encoder(self.problems)
+        current_tour = current_tour.clone()
+        current_length = self.compute_tour_lengths(current_tour)
+        no_improve = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+        last_traj: Optional[ImprovementTrajectory] = None
+
+        while torch.any(no_improve < patience):
+            active_mask = no_improve < patience
+            scores = model.compute_backtrack_scores(
+                self.problems,
+                current_tour,
+                node_embeddings=node_embeddings,
+            )
+            k = min(topk, scores.size(1))
+
+            log_prefix_probs = F.log_softmax(scores, dim=-1)
+            prefix_probs = log_prefix_probs.exp()
+            if torch.any(~active_mask):
+                inactive = (~active_mask).nonzero(as_tuple=False).flatten()
+                prefix_probs[inactive] = torch.ones_like(prefix_probs[inactive]) / scores.size(1)
+
+            sampled_prefix = torch.multinomial(prefix_probs, num_samples=k, replacement=False)
+
+            prefixes: List[List[List[int]]] = []
+            for b in range(batch_size):
+                prefix_list: List[List[int]] = []
+                for idx in sampled_prefix[b]:
+                    seq = current_tour[b, : idx.item() + 1].tolist()
+                    prefix_list.append(seq)
+                prefixes.append(prefix_list)
+
+            candidate_tours, log_suffix = model.reconstruct_from_prefix(
+                self.problems,
+                prefixes,
+                num_samples=num_samples,
+                greedy=greedy,
+                node_embeddings=node_embeddings,
+                return_log_prob=True,
+            )
+            candidate_lengths = self.compute_tour_lengths(candidate_tours).view(batch_size, k, num_samples)
+            best_suffix_lengths, best_suffix_idx = candidate_lengths.min(dim=2)
+            final_lengths, best_prefix_slot = best_suffix_lengths.min(dim=1)
+            suffix_slot = best_suffix_idx[
+                torch.arange(batch_size, device=device), best_prefix_slot
+            ]
+
+            tours_view = candidate_tours.view(batch_size, k, num_samples, self.problem_size)
+            final_tour = tours_view[
+                torch.arange(batch_size, device=device), best_prefix_slot, suffix_slot, :
+            ]
+
+            prefix_index = sampled_prefix[
+                torch.arange(batch_size, device=device), best_prefix_slot
+            ]
+            log_suffix = log_suffix.view(batch_size, k, num_samples)
+            selected_log_suffix = log_suffix[
+                torch.arange(batch_size, device=device), best_prefix_slot, suffix_slot
+            ]
+            log_pf_prefix = log_prefix_probs[
+                torch.arange(batch_size, device=device), prefix_index
+            ]
+            log_pf = log_pf_prefix + selected_log_suffix
+
+            child_scores = model.compute_backtrack_scores(
+                self.problems,
+                final_tour,
+                node_embeddings=node_embeddings,
+            )
+            log_pb = F.log_softmax(child_scores, dim=-1)[
+                torch.arange(batch_size, device=device), prefix_index
+            ]
+
+            reward = -final_lengths
+
+            better_mask = final_lengths < current_length
+            current_tour = torch.where(better_mask.unsqueeze(1), final_tour, current_tour)
+            current_length = torch.where(better_mask, final_lengths, current_length)
+            no_improve = torch.where(
+                better_mask,
+                torch.zeros_like(no_improve),
+                torch.where(active_mask, no_improve + 1, no_improve),
+            )
+
+            last_traj = ImprovementTrajectory(
+                prefix_index=prefix_index,
+                candidate_tours=candidate_tours,
+                final_tour=final_tour,
+                log_pf=log_pf,
+                log_pb=log_pb,
+                reward=reward,
+            )
+
+        if last_traj is None:
+            raise RuntimeError("优化过程中未生成任何轨迹")
+        return last_traj
 
     ###################################################################
     # 计算路径长度
