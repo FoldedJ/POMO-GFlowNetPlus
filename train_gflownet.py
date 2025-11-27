@@ -20,7 +20,7 @@ def train(
     eval_interval=10,
     save_interval=10, # 每10个epoch保存一次模型
     save_dir="./checkpoints", # 模型保存路径
-    encoder_layer_num=1,
+    encoder_layer_num=1, #6
     ff_hidden_dim=512, # embedding_dim * 4
     log_dir="./logs", # 日志保存路径
     lambda_v=1.0, # 价值损失权重

@@ -6,35 +6,22 @@ from TSProblemDef import get_random_problems
 
 @dataclass
 class ImproveState:
-    """
-    改进环境的状态定义。
-    包含当前路径、路径长度、当前步数和是否结束的标志。
-    """
     current_tour: torch.Tensor  # 当前完整路径，shape: (batch, problem)
-    path_length: torch.Tensor   # 当前路径长度，shape: (batch,)
-    step_count: torch.Tensor             # 当前已执行的步数
-    done: torch.Tensor                  # 标志，表示当前剧集是否结束，shape: (batch,)
+    path_length: torch.Tensor   # 当前路径长度
+    step_count: torch.Tensor             # 当前已执行的步数 ？ 为什么要记录步数###############################
+    done: torch.Tensor                  # 标志，表示当前episode是否结束
 
 
 class TSPEnv_Improve:
-    """
-    TSP改进环境类。
-    该环境用于模拟TSP问题的路径改进过程，支持回溯-重构操作。
-    """
     def __init__(self, device, **env_params):
-        """
-        初始化TSP改进环境。
-        Args:
-            device (torch.device): 运行环境的设备 (CPU或CUDA)。
-            env_params (dict): 环境参数，包括 'problem_size' 和可选的 'max_steps'。
-        """
         self.env_params = env_params
         self.problem_size = env_params['problem_size']  # TSP问题的规模（城市数量）
-        # 最大步数，用于限制每个剧集的迭代次数，默认为问题规模的两倍
+        # 最大步数，用于限制每个episode的迭代次数，默认为问题规模的两倍 ? 步数到底是干什么###################################
         self.max_steps = env_params.get('max_steps', self.problem_size * 2)
-        self.batch_size = None  # 批处理大小
-        self.problems = None    # 存储TSP问题实例，shape: (batch, problem, 2)
-        self.device = device    # 设备 (CPU或CUDA)
+        self.eta = env_params.get('eta', 1.0) # GFlowNet奖励函数的eta参数
+        self.batch_size = None  
+        self.problems = None    # shape: (batch, problem, 2)
+        self.device = device
 
     def __call__(self, problems):
         self.batch_size = problems.shape[0]
@@ -46,8 +33,6 @@ class TSPEnv_Improve:
     def load_problems(self, batch_size):
         """
         加载TSP问题实例。
-        Args:
-            batch_size (int): 批处理大小。
         """
         self.batch_size = batch_size
         self.problems = get_random_problems(batch_size, self.problem_size)
@@ -59,10 +44,7 @@ class TSPEnv_Improve:
         """
         重置环境，生成一个初始的TSP路径。
         Args:
-            problems (torch.Tensor): TSP问题实例，shape: (batch, problem, 2)。
             initial_method (str): 初始路径的生成方法，目前只支持 "random"。
-        Returns:
-            ImproveState: 包含初始路径、路径长度、步数和结束标志的状态对象。
         Raises:
             NotImplementedError: 如果使用了不支持的初始化方法。
         """
@@ -87,19 +69,6 @@ class TSPEnv_Improve:
         return state
 
     def step(self, state: ImproveState, backtrack_point, city_to_insert, edge_to_insert):
-        """
-        执行一步环境操作，根据给定的动作进行路径重构。
-        Args:
-            state (ImproveState): 当前环境状态。
-            backtrack_point (torch.Tensor): 回溯点的索引，shape: (batch,)
-            city_to_insert (torch.Tensor): 待插入城市的索引，shape: (batch,)
-            edge_to_insert (torch.Tensor): 插入边的两个节点索引，shape: (batch, 2)
-        Returns:
-            tuple: (next_state, reward, done)
-                next_state (ImproveState): 下一个环境状态。
-                reward (torch.Tensor): 奖励值，shape: (batch,)。
-                done (bool): 标志，表示当前剧集是否结束。
-        """
         old_tour = state.current_tour
         old_length = state.path_length
         old_step_count = state.step_count
@@ -109,8 +78,8 @@ class TSPEnv_Improve:
         new_length = self._get_tour_length(new_tour)
 
         # 2. 计算奖励
-        # 奖励为路径长度的改进量 (旧长度 - 新长度)
-        reward = old_length - new_length
+        # 奖励为路径质量奖励：R(pi) = exp(-eta * L(pi))
+        reward = torch.exp(-self.eta * new_length)
 
         # 3. 更新步数
         new_step_count = old_step_count + 1

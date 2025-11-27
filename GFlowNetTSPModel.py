@@ -137,6 +137,22 @@ class EncoderLayer(nn.Module):
         # shape: (batch, problem, EMBEDDING_DIM)
 
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        # x shape: (batch, problem, embedding_dim)
+        # pe shape: (1, max_len, embedding_dim)
+        return x + self.pe[:, :x.size(1)]
+
+
 class TSP_Encoder(nn.Module):
     def __init__(self, **model_params):
         super().__init__()
@@ -145,12 +161,19 @@ class TSP_Encoder(nn.Module):
         encoder_layer_num = self.model_params['encoder_layer_num']
 
         self.embedding = nn.Linear(2, embedding_dim)
+        self.positional_encoding = PositionalEncoding(embedding_dim, max_len=model_params['problem_size'])
         self.layers = nn.ModuleList([EncoderLayer(**model_params) for _ in range(encoder_layer_num)])
 
     def forward(self, data):
         # data.shape: (batch, problem, 2)
 
-        embedded_input = self.embedding(data)
+        # 输入归一化
+        min_coords = data.min(dim=1, keepdim=True)[0] # (batch, 1, 2)
+        max_coords = data.max(dim=1, keepdim=True)[0] # (batch, 1, 2)
+        normalized_data = (data - min_coords) / (max_coords - min_coords + 1e-6) # 避免除以零
+
+        embedded_input = self.embedding(normalized_data)
+        embedded_input = self.positional_encoding(embedded_input)
         # shape: (batch, problem, embedding)
 
         out = embedded_input
@@ -168,27 +191,21 @@ class ValueNetwork(nn.Module):
         self.encoder = encoder  # 复用POMO的编码器
         embedding_dim = self.model_params['embedding_dim']
 
-        self.global_pool = nn.AdaptiveAvgPool1d(1)   # 全局信息聚合
-        self.value_head = nn.Sequential(              # 预测剩余长度
+        self.value_head = nn.Sequential(              # 预测每个城市对应的剩余长度V(s_i)
             nn.Linear(embedding_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1)   # 输出预测的剩余路径长度
+            nn.Linear(32, 1)   # 输出每个城市的预测剩余路径长度
         )
 
     def forward(self, city_coordinates): # 这里的city_coordinates就是reset_state.problems
         # 编码所有城市
         city_embeddings = self.encoder(city_coordinates)  # shape: (batch, problem, embedding)
         
-        # 聚合全局信息
-        # permute(0, 2, 1) 将 (batch, problem, embedding) 变为 (batch, embedding, problem)
-        # 这样AdaptiveAvgPool1d才能在problem维度上进行平均
-        global_info = self.global_pool(city_embeddings.permute(0, 2, 1)).squeeze(2)  # shape: (batch, embedding)
-        
-        # 预测剩余长度
-        predicted_length = self.value_head(global_info)  # shape: (batch, 1)
-        return predicted_length
+        # 预测每个城市对应的剩余长度V(s_i)
+        predicted_lengths = self.value_head(city_embeddings).squeeze(-1)  # shape: (batch, problem)
+        return predicted_lengths
 
 
 # 3. 回溯策略网络
@@ -200,12 +217,12 @@ class BacktrackPolicyNetwork(nn.Module):
         embedding_dim = self.model_params['embedding_dim']
 
         self.backtrack_head = nn.Sequential(
-            nn.Linear(embedding_dim * 2, 64),  # 城市嵌入 + 全局上下文信息
+            nn.Linear(embedding_dim * 2 + 1, 64),  # 城市嵌入 + 全局上下文信息 + 价值网络预测
             nn.ReLU(),
             nn.Linear(64, 1)           # 输出该点的回溯潜力值
         )
 
-    def forward(self, city_coordinates, current_tour): # current_tour: (batch, problem)
+    def forward(self, city_coordinates, current_tour, predicted_lengths_from_value_net): # current_tour: (batch, problem)
         # 获取城市嵌入
         city_embeddings = self.encoder(city_coordinates)  # shape: (batch, problem, embedding)
         
@@ -219,8 +236,8 @@ class BacktrackPolicyNetwork(nn.Module):
         # 扩展全局上下文，使其与city_embeddings的problem维度匹配
         global_context_expanded = global_context.unsqueeze(1).expand(batch_size, problem_size, embedding_dim)
 
-        # 组合特征：每个城市嵌入与其对应的全局上下文拼接
-        combined_features = torch.cat([city_embeddings, global_context_expanded], dim=-1) # shape: (batch, problem, embedding*2)
+        # 组合特征：每个城市嵌入、其对应的全局上下文以及价值网络预测值拼接
+        combined_features = torch.cat([city_embeddings, global_context_expanded, predicted_lengths_from_value_net.unsqueeze(-1)], dim=-1) # shape: (batch, problem, embedding*2+1)
         
         # 计算回溯潜力值
         backtrack_potentials = self.backtrack_head(combined_features).squeeze(-1)  # shape: (batch, problem)
@@ -249,26 +266,29 @@ class ReconstructionPolicyNetwork(nn.Module):
 
         # Head for selecting city_to_insert (选择要插入的城市)
         self.city_selection_head = nn.Sequential(
-            nn.Linear(embedding_dim, 64),
+            nn.Linear(embedding_dim + 1, 64),  # 城市嵌入 + 价值网络预测
             nn.ReLU(),
             nn.Linear(64, 1) # Output a score for each city
         )
 
         # Head for selecting edge_to_insert (通过选择边的第一个节点来选择要插入的边)
         self.edge_selection_head = nn.Sequential(
-            nn.Linear(embedding_dim, 64),
+            nn.Linear(embedding_dim + 1, 64),  # 城市嵌入 + 价值网络预测
             nn.ReLU(),
             nn.Linear(64, 1) # Output a score for each node (as start of an edge)
         )
 
-    def forward(self, city_coordinates, current_tour):
+    def forward(self, city_coordinates, current_tour, predicted_lengths_from_value_net):
         # city_coordinates: (batch, problem, 2)
         # current_tour: (batch, problem) - contains city indices in order
+        # predicted_lengths_from_value_net: (batch, problem)
 
         city_embeddings = self.encoder(city_coordinates)  # shape: (batch, problem, embedding)
 
         # Predict probabilities for city_to_insert (预测要插入的城市的概率)
-        city_logits = self.city_selection_head(city_embeddings).squeeze(-1) # shape: (batch, problem)
+        # 拼接城市嵌入和价值网络预测
+        city_features = torch.cat([city_embeddings, predicted_lengths_from_value_net.unsqueeze(-1)], dim=-1) # (batch, problem, embedding + 1)
+        city_logits = self.city_selection_head(city_features).squeeze(-1) # shape: (batch, problem)
         city_to_insert_probs = F.softmax(city_logits, dim=-1)
 
         # Predict probabilities for edge_to_insert (预测要插入的边的概率)
@@ -281,8 +301,13 @@ class ReconstructionPolicyNetwork(nn.Module):
         batch_size, problem_size, embedding_dim = city_embeddings.shape
         gathering_index = current_tour.unsqueeze(2).expand(batch_size, problem_size, embedding_dim)
         tour_node_embeddings = city_embeddings.gather(dim=1, index=gathering_index) # shape: (batch, problem, embedding)
+        
+        # 拼接路径节点嵌入和价值网络预测
+        gathering_index_value = current_tour.unsqueeze(2).expand(batch_size, problem_size, 1)
+        tour_node_values = predicted_lengths_from_value_net.unsqueeze(-1).gather(dim=1, index=gathering_index_value) # shape: (batch, problem, 1)
+        edge_features = torch.cat([tour_node_embeddings, tour_node_values], dim=-1) # (batch, problem, embedding + 1)
 
-        edge_logits = self.edge_selection_head(tour_node_embeddings).squeeze(-1) # shape: (batch, problem)
+        edge_logits = self.edge_selection_head(edge_features).squeeze(-1) # shape: (batch, problem)
         edge_to_insert_probs = F.softmax(edge_logits, dim=-1)
 
         return city_to_insert_probs, edge_to_insert_probs
@@ -314,10 +339,10 @@ class GFlowNetTSPModel(nn.Module):
         predicted_value = self.value_network(city_coordinates) # shape: (batch, 1)
 
         # 回溯策略网络计算回溯潜力
-        backtrack_potentials = self.backtrack_policy_network(city_coordinates, current_tour) # shape: (batch, problem)
+        backtrack_potentials = self.backtrack_policy_network(city_coordinates, current_tour, predicted_value) # shape: (batch, problem)
 
         # 重构策略网络计算城市和边的选择概率
-        city_to_insert_probs, edge_to_insert_probs = self.reconstruction_policy_network(city_coordinates, current_tour)
+        city_to_insert_probs, edge_to_insert_probs = self.reconstruction_policy_network(city_coordinates, current_tour, predicted_value)
         # city_to_insert_probs: (batch, problem)
         # edge_to_insert_probs: (batch, problem)
 
