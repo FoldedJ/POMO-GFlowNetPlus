@@ -1,35 +1,24 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
-
 from improver.ImproverModelParts import SharedEncoder, SharedDecoder, compute_tour_length
 
-
-@dataclass
-class ReconstructionState:   
-    """重构状态，供重构使用
-    - encoded_nodes: (batch, problem, D)
-    - visited: (batch, problem) bool mask
+class OptimizationState:
+    """优化状态：记录当前优化过程的状态
+    属性：
+      - problems: (batch, problem, 2) 问题实例
+      - current_tour: (batch, problem) 当前构造的路径
+      - encoded_nodes: (batch, problem, embedding_dim) 编码后的节点表示
+      - value_net_params: 价值网络参数
+      - step: 当前优化步数
     """
-    encoded_nodes: torch.Tensor # 编码后的节点特征
-    visited: torch.Tensor # 访问掩码
-
-    @classmethod
-    def from_prefix(cls, encoded_nodes: torch.Tensor, prefix: torch.Tensor):
-        """根据前缀构造重构状态（初始化访问掩码）
-        Args:
-            encoded_nodes: (batch, problem, D) 编码后的节点特征
-            prefix: (batch, k) 前缀路径，k为前缀长度
-        Returns:
-            ReconstructionState: 重构状态
-        """
-        batch, problem_size, _ = encoded_nodes.shape
-        device = encoded_nodes.device
-        visited = torch.zeros((batch, problem_size), dtype=torch.bool, device=device)  # 初始掩码
-        if prefix.numel() > 0:
-            visited[torch.arange(batch)[:, None], prefix] = True
-        return cls(encoded_nodes=encoded_nodes, visited=visited)
+    def __init__(self, problems: torch.Tensor, current_tour: torch.Tensor, encoded_nodes: torch.Tensor,
+                 value_net_params=None, step: int = 0):
+        self.problems = problems
+        self.current_tour = current_tour
+        self.encoded_nodes = encoded_nodes
+        self.value_net_params = value_net_params
+        self.step = step
 
 class ValueNetwork(nn.Module):
     """价值网络：预测从当前状态到终点的剩余路径长度
@@ -40,40 +29,27 @@ class ValueNetwork(nn.Module):
     输出：
       - pred_remaining: (batch,) 预测的剩余长度
     """
-    def __init__(self, shared_encoder: SharedEncoder, hidden_dims=(128, 64)):
+    def __init__(self, shared_encoder: SharedEncoder):
         super().__init__()
         self.encoder = shared_encoder
-        # 拼接：最后节点嵌入、全局上下文、剩余城市数、前缀长度
-        in_dim = self.encoder.model_params['embedding_dim'] * 2 + 2
-        dims = [in_dim] + list(hidden_dims) + [1]
-        layers = []
-        # 构造价值网络（线性层 + ReLU 激活）
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers.append(nn.ReLU())
-        self.head = nn.Sequential(*layers)
+        D = self.encoder.model_params['embedding_dim']
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.head = nn.Sequential(
+            nn.Linear(D, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
 
     def forward(self, problems: torch.Tensor, visited_mask: torch.Tensor, last_idx: torch.Tensor) -> torch.Tensor:
-        if problems.dim() != 3 or problems.size(-1) != 2:
-            raise ValueError("problems must be (batch, problem, 2)")
-        if visited_mask.dim() != 2:
-            raise ValueError("visited_mask must be (batch, problem)")
         
         batch, problem_size, _ = problems.shape
-        node_embed = self.encoder(problems)  # (batch, problem, D) 图编码
-        D = node_embed.size(2)
-        
-        if last_idx.dim() != 1 or last_idx.size(0) != batch:
-            raise ValueError("last_idx must be (batch,)")
-        
-        last_embed = node_embed[torch.arange(batch), last_idx]  # (batch, D) 前缀最后节点嵌入
-        global_ctx = node_embed.mean(dim=1)  # (batch, D) 全局平均池化
-        remaining_count = (visited_mask == 0).sum(dim=1).float().unsqueeze(1)  # (batch, 1) 剩余城市数
-        prefix_count = (visited_mask == 1).sum(dim=1).float().unsqueeze(1)  # (batch, 1) 前缀长度
-
-        feat = torch.cat([last_embed, global_ctx, remaining_count, prefix_count], dim=1)  # 融合状态特征
-        pred = self.head(feat).squeeze(1)  # (batch,) 预测剩余长度
+        node_embed = self.encoder(problems)
+        x = node_embed.transpose(1, 2)
+        pooled = self.pool(x)
+        global_ctx = pooled.squeeze(2)
+        pred = self.head(global_ctx).squeeze(1)
         return pred
 
 
@@ -95,11 +71,8 @@ class BacktrackPolicy(nn.Module):
             nn.Linear(64, 1),
         )
 
-    def forward(self, problems: torch.Tensor, tour: torch.Tensor) -> torch.Tensor:
-        if problems.dim() != 3 or problems.size(-1) != 2:
-            raise ValueError("problems must be (batch, problem, 2)")
-        if tour.dim() != 2:
-            raise ValueError("tour must be (batch, problem)")
+    def forward(self, problems: torch.Tensor, tour: torch.Tensor) -> torch.Tensor:  
+
         batch, problem_size, _ = problems.shape
         node_embed = self.encoder(problems)  # (batch, problem, D)
         global_ctx = node_embed.mean(dim=1).unsqueeze(1).expand(batch, problem_size, node_embed.size(2))  # 平均作为上下文
@@ -134,56 +107,45 @@ class ReconstructionPolicy(nn.Module):
         super().__init__()
         self.decoder = shared_decoder
 
-    
-
-    def reconstruct_suffix(self, problems: torch.Tensor, encoded_nodes: torch.Tensor, prefix: torch.Tensor,
+    def reconstruct_suffix(self, problems: torch.Tensor, opt_state: OptimizationState, prefix: torch.Tensor,
                            eval_type: str = 'argmax') -> torch.Tensor:
-        """基于前缀生成剩余路径，返回完整路径 (batch, problem)"""
-        state = ReconstructionState.from_prefix(encoded_nodes, prefix)  # 构造显式状态
-        tour, _ = self.reconstruct_suffix_state(problems, state, prefix=prefix, eval_type=eval_type, return_logprob=False)
+        tour, _ = self.reconstruct_suffix_state(problems, opt_state, prefix=prefix, eval_type=eval_type, return_logprob=False)
         return tour
 
-    def reconstruct_suffix_state(self, problems: torch.Tensor, state: ReconstructionState,
+    def reconstruct_suffix_state(self, problems: torch.Tensor, opt_state: OptimizationState,
                                  prefix: torch.Tensor, eval_type: str = 'argmax', return_logprob: bool = False):
-        """基于显式 state 生成后缀
-        Inputs:
-          - problems: (batch, problem, 2)
-          - state: ReconstructionState(encoded_nodes, visited)
-          - prefix: (batch, t) 当前已固定的前缀序列
-        Returns:
-          - tour: (batch, problem)
-          - logprob_sum: (batch,) if return_logprob, else zeros
-        """
         device = problems.device
         batch, problem_size, _ = problems.shape
 
-        self.decoder.set_kv(state.encoded_nodes)  # 设定K/V
+        self.decoder.set_kv(opt_state.encoded_nodes)
         last_idx = prefix[:, -1]
-        q1_nodes = state.encoded_nodes[torch.arange(batch), last_idx].unsqueeze(1)  # 首节点q
+        q1_nodes = opt_state.encoded_nodes[torch.arange(batch), last_idx].unsqueeze(1)
         self.decoder.set_q1(q1_nodes)
 
         tour = prefix.clone()
         current_last = last_idx.clone()
-        logprob_sum = torch.zeros(batch, device=device)  # 训练时累计logP
+        logprob_sum = torch.zeros(batch, device=device)
+        visited = torch.zeros(batch, problem_size, dtype=torch.bool, device=device)
+        visited[torch.arange(batch)[:, None], prefix] = True
 
         while tour.size(1) < problem_size:
-            ninf_mask = torch.zeros((batch, 1, problem_size), device=device)  # 掩码：已访问不可选
-            ninf_mask = ninf_mask.masked_fill(state.visited.unsqueeze(1), float('-inf'))
-            enc_last = state.encoded_nodes[torch.arange(batch), current_last].unsqueeze(1)  # (batch,1,D)
-            probs = self.decoder(enc_last, ninf_mask=ninf_mask)  # (batch,1,problem)
+            ninf_mask = torch.zeros((batch, 1, problem_size), device=device)
+            ninf_mask = ninf_mask.masked_fill(visited.unsqueeze(1), float('-inf'))
+            enc_last = opt_state.encoded_nodes[torch.arange(batch), current_last].unsqueeze(1)
+            probs = self.decoder(enc_last, ninf_mask=ninf_mask)
 
             if eval_type == 'softmax':
                 if (probs.sum(dim=2) == 0).any():
-                    raise RuntimeError("All probabilities are zero under mask; check state/visited")
-                logits = torch.log(probs.squeeze(1) + 1e-12)  # 数值稳定
-                selected = torch.distributions.Categorical(logits=logits).sample()  # 抽样选择下一城市
+                    raise RuntimeError("All probabilities are zero under mask; check visited")
+                logits = torch.log(probs.squeeze(1) + 1e-12)
+                selected = torch.distributions.Categorical(logits=logits).sample()
                 if return_logprob:
                     logprob_sum = logprob_sum + logits[torch.arange(batch), selected]
             else:
-                selected = probs.argmax(dim=2).squeeze(1)  # 贪心选择
+                selected = probs.argmax(dim=2).squeeze(1)
 
-            tour = torch.cat([tour, selected[:, None]], dim=1)  # 扩展路径
-            state.visited[torch.arange(batch), selected] = True  # 更新状态
+            tour = torch.cat([tour, selected[:, None]], dim=1)
+            visited[torch.arange(batch), selected] = True
             current_last = selected
 
         return tour, logprob_sum

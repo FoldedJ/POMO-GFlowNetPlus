@@ -204,3 +204,56 @@ def compute_tour_length(problems: torch.Tensor, tours: torch.Tensor) -> torch.Te
     travel_distances = segment_lengths.sum(1)
     return travel_distances
 
+def compute_remaining_length(problems: torch.Tensor, tours: torch.Tensor, prefix_len: torch.Tensor) -> torch.Tensor:
+    """计算剩余路径长度
+    problems: (batch, problem, 2)
+    tours: (batch, problem) 每个元素为城市索引
+    prefix_len: (batch,) 每个样本的已访问城市数
+    返回: (batch,) 剩余路径长度
+    """
+    if problems.dim() != 3 or problems.size(-1) != 2:
+        raise ValueError("problems tensor must be (batch, problem, 2)")
+    if tours.dim() != 2:
+        raise ValueError("tours tensor must be (batch, problem)")
+    if prefix_len.dim() != 1 or prefix_len.size(0) != problems.size(0):
+        raise ValueError("prefix_len must be (batch,)")
+    batch = problems.size(0)
+    problem_size = problems.size(1)
+    if tours.size(0) != batch or tours.size(1) != problem_size:
+        raise ValueError("tours must match problems batch and problem_size")
+    if tours.dtype != torch.long:
+        tours = tours.long()
+    gathering_index = tours.unsqueeze(2).expand(batch, problem_size, 2)
+    ordered_seq = problems.gather(dim=1, index=gathering_index)
+    rolled_seq = ordered_seq.roll(dims=1, shifts=-1)
+    segment_lengths = ((ordered_seq - rolled_seq) ** 2).sum(2).sqrt()
+    start_idx = (prefix_len - 1).clamp(min=0)
+    idx = torch.arange(problem_size, device=problems.device).unsqueeze(0).expand(batch, problem_size)
+    mask = (idx >= start_idx.unsqueeze(1)).float()
+    return (segment_lengths * mask).sum(1)
+
+def compute_suffix_lengths(problems: torch.Tensor, tours: torch.Tensor) -> torch.Tensor:
+    """计算后缀路径长度
+    problems: (batch, problem, 2)
+    tours: (batch, problem) 每个元素为城市索引
+    返回: (batch, problem) 每个城市到路径结束的距离
+    """
+    if problems.dim() != 3 or problems.size(-1) != 2:
+        raise ValueError("problems tensor must be (batch, problem, 2)")
+    if tours.dim() != 2:
+        raise ValueError("tours tensor must be (batch, problem)")
+    batch = problems.size(0)
+    problem_size = problems.size(1)
+    if tours.size(0) != batch or tours.size(1) != problem_size:
+        raise ValueError("tours must match problems batch and problem_size")
+    if tours.dtype != torch.long:
+        tours = tours.long()
+    gathering_index = tours.unsqueeze(2).expand(batch, problem_size, 2)
+    ordered_seq = problems.gather(dim=1, index=gathering_index)
+    rolled_seq = ordered_seq.roll(dims=1, shifts=-1)
+    segment_lengths = ((ordered_seq - rolled_seq) ** 2).sum(2).sqrt()  # (batch, problem)
+    suffix = torch.zeros_like(segment_lengths)
+    for t in range(problem_size):
+        suffix[:, t] = segment_lengths[:, t:].sum(dim=1)
+    return suffix
+
