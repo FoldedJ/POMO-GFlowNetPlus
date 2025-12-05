@@ -59,68 +59,6 @@ class EncoderLayer(nn.Module):
         out3 = self.addAndNormalization2(out1, out2)  # 残差+归一化
         return out3
 
-
-class SharedDecoder(nn.Module):
-    """SharedDecoder
-    set_kv(encoded_nodes), set_q1(encoded_q1), forward(encoded_last_node, ninf_mask)
-    - Shapes遵循接口约定，异常时抛出 ValueError
-    """
-    def __init__(self, **model_params):
-        super().__init__()
-        self.model_params = model_params
-        embedding_dim = self.model_params['embedding_dim']
-        head_num = self.model_params['head_num']
-        qkv_dim = self.model_params['qkv_dim']
-
-        self.Wq_first = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)  # 首节点Q
-        self.Wq_last = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)   # 末节点Q
-        self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)       # K
-        self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)       # V
-        self.multi_head_combine = nn.Linear(head_num * qkv_dim, embedding_dim)   # 合并多头
-
-        self.k = None
-        self.v = None
-        self.single_head_key = None
-        self.q_first = None
-
-    def set_kv(self, encoded_nodes):
-        """Input: (batch, problem, embedding) -> prepare K,V, single_head_key"""
-        head_num = self.model_params['head_num']
-        if encoded_nodes.dim() != 3:
-            raise ValueError("encoded_nodes must be (batch, problem, embedding)")
-        self.k = reshape_by_heads(self.Wk(encoded_nodes), head_num=head_num)  # (batch, head, n, dim)
-        self.v = reshape_by_heads(self.Wv(encoded_nodes), head_num=head_num)
-        self.single_head_key = encoded_nodes.transpose(1, 2)  # (batch, emb, n) 用于打分
-
-    def set_q1(self, encoded_q1):
-        """Input: (batch, n, embedding) -> prepare q_first"""
-        head_num = self.model_params['head_num']
-        if encoded_q1.dim() != 3:
-            raise ValueError("encoded_q1 must be (batch, n, embedding)")
-        self.q_first = reshape_by_heads(self.Wq_first(encoded_q1), head_num=head_num)  # (batch, head, n, dim)
-
-    def forward(self, encoded_last_node, ninf_mask):
-        """Inputs: (batch, n, embedding), (batch, group, problem) -> Output: (batch, n, problem)"""
-        head_num = self.model_params['head_num']
-        if encoded_last_node.dim() != 3:
-            raise ValueError("encoded_last_node must be (batch, n, embedding)")
-        if ninf_mask is None or ninf_mask.dim() != 3:
-            raise ValueError("ninf_mask must be (batch, group, problem)")
-        q_last = reshape_by_heads(self.Wq_last(encoded_last_node), head_num=head_num)  # 末节点Q
-        q = self.q_first + q_last  # 组合首末节点信息
-        out_concat = multi_head_attention(q, self.k, self.v, rank3_ninf_mask=ninf_mask)  # 掩码注意力
-        mh_atten_out = self.multi_head_combine(out_concat)
-        score = torch.matmul(mh_atten_out, self.single_head_key)  # 与K(单头)做相似度打分
-
-        sqrt_embedding_dim = self.model_params['sqrt_embedding_dim']
-        logit_clipping = self.model_params['logit_clipping']
-        score_scaled = score / sqrt_embedding_dim  # 缩放避免梯度爆炸
-        score_clipped = logit_clipping * torch.tanh(score_scaled)  # logits裁剪
-        score_masked = score_clipped + ninf_mask  # 已访问位置置为 -inf
-        probs = F.softmax(score_masked, dim=2)  # 得到选择分布
-        return probs
-
-
 def reshape_by_heads(qkv, head_num):
     """Reshape linear outputs to (batch, head, n, dim_per_head) for multi-head attention"""
     batch_s = qkv.size(0)
@@ -205,55 +143,49 @@ def compute_tour_length(problems: torch.Tensor, tours: torch.Tensor) -> torch.Te
     return travel_distances
 
 def compute_remaining_length(problems: torch.Tensor, tours: torch.Tensor, prefix_len: torch.Tensor) -> torch.Tensor:
-    """计算剩余路径长度
+    """
+    计算剩余路径长度
     problems: (batch, problem, 2)
     tours: (batch, problem) 每个元素为城市索引
     prefix_len: (batch,) 每个样本的已访问城市数
     返回: (batch,) 剩余路径长度
     """
-    if problems.dim() != 3 or problems.size(-1) != 2:
-        raise ValueError("problems tensor must be (batch, problem, 2)")
-    if tours.dim() != 2:
-        raise ValueError("tours tensor must be (batch, problem)")
-    if prefix_len.dim() != 1 or prefix_len.size(0) != problems.size(0):
-        raise ValueError("prefix_len must be (batch,)")
     batch = problems.size(0)
     problem_size = problems.size(1)
-    if tours.size(0) != batch or tours.size(1) != problem_size:
-        raise ValueError("tours must match problems batch and problem_size")
-    if tours.dtype != torch.long:
-        tours = tours.long()
+    
+    # 根据tour重新排列城市坐标
     gathering_index = tours.unsqueeze(2).expand(batch, problem_size, 2)
     ordered_seq = problems.gather(dim=1, index=gathering_index)
+    # 计算欧式距离
     rolled_seq = ordered_seq.roll(dims=1, shifts=-1)
     segment_lengths = ((ordered_seq - rolled_seq) ** 2).sum(2).sqrt()
+    # 生成剩余路径的掩码
     start_idx = (prefix_len - 1).clamp(min=0)
     idx = torch.arange(problem_size, device=problems.device).unsqueeze(0).expand(batch, problem_size)
     mask = (idx >= start_idx.unsqueeze(1)).float()
+    
     return (segment_lengths * mask).sum(1)
 
 def compute_suffix_lengths(problems: torch.Tensor, tours: torch.Tensor) -> torch.Tensor:
-    """计算后缀路径长度
+    """
+    计算每个节点到路径结束的距离
     problems: (batch, problem, 2)
     tours: (batch, problem) 每个元素为城市索引
     返回: (batch, problem) 每个城市到路径结束的距离
     """
-    if problems.dim() != 3 or problems.size(-1) != 2:
-        raise ValueError("problems tensor must be (batch, problem, 2)")
-    if tours.dim() != 2:
-        raise ValueError("tours tensor must be (batch, problem)")
     batch = problems.size(0)
     problem_size = problems.size(1)
-    if tours.size(0) != batch or tours.size(1) != problem_size:
-        raise ValueError("tours must match problems batch and problem_size")
-    if tours.dtype != torch.long:
-        tours = tours.long()
+    
+    # 根据tour重新排列城市坐标
     gathering_index = tours.unsqueeze(2).expand(batch, problem_size, 2)
     ordered_seq = problems.gather(dim=1, index=gathering_index)
+    # 计算欧式距离
     rolled_seq = ordered_seq.roll(dims=1, shifts=-1)
     segment_lengths = ((ordered_seq - rolled_seq) ** 2).sum(2).sqrt()  # (batch, problem)
-    suffix = torch.zeros_like(segment_lengths)
-    for t in range(problem_size):
-        suffix[:, t] = segment_lengths[:, t:].sum(dim=1)
+    # 反转累加得到后缀距离
+    reversed_lengths = segment_lengths.flip(dims=[1])
+    reversed_cumsum = reversed_lengths.cumsum(dim=1)
+    suffix = reversed_cumsum.flip(dims=[1])
+    
     return suffix
 

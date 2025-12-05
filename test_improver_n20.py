@@ -24,8 +24,6 @@ from utils.utils import create_logger, util_save_log_image_with_label, LogData
 import torch
 from improver.GFlowImprover import GFlowImprover  # 单次改进器
 from improver.ImproverModelParts import compute_tour_length
-from TSPModel import TSPModel
-from TSPEnv import TSPEnv
 
 ##########################################################################################
 # parameters

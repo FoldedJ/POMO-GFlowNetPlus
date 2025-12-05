@@ -1,9 +1,9 @@
 ##########################################################################################
 # Machine Environment Config
 
-DEBUG_MODE = False  # 调试模式（减少训练规模与频率）
-USE_CUDA = not DEBUG_MODE  # 是否使用GPU
-CUDA_DEVICE_NUM = 0  # GPU设备编号
+DEBUG_MODE = False
+USE_CUDA = not DEBUG_MODE
+CUDA_DEVICE_NUM = 0
 
 ##########################################################################################
 # Path Config
@@ -11,8 +11,8 @@ CUDA_DEVICE_NUM = 0  # GPU设备编号
 import os
 import sys
 
-os.chdir(os.path.dirname(os.path.abspath(__file__)))  # 将工作目录切到脚本所在位置
-sys.path.insert(0, "..")  # 方便导入上层包
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, "..")
 sys.path.insert(0, "../..")
 
 ##########################################################################################
@@ -21,7 +21,7 @@ sys.path.insert(0, "../..")
 import logging
 from utils.utils import create_logger
 
-from improver.GFlowTrainerCore import GFlowTBTrainer, TBConfig  # 导入TB训练器与配置
+from improver.GFlowTrainerCore import GFlowTBTrainer, TBConfig
 
 ##########################################################################################
 # parameters
@@ -41,15 +41,17 @@ model_params = {  # 模型结构参数（与原POMO一致）
 trainer_params = {  # 训练流程参数
     'use_cuda': USE_CUDA,
     'cuda_device_num': CUDA_DEVICE_NUM,
-    'epochs': 1000,
+    'epochs': 100, # 1000
     'logging': {
-        'model_save_interval': 100,
+        'model_save_interval': 10, # 100
         'img_save_file': 'style_loss_1.json'
     },
 }
 
 tb_cfg = TBConfig(temperature=1.0, lr=1e-4, weight_decay=1e-6,
-                  train_batch_size=64, train_episodes=10000, save_interval=trainer_params['logging']['model_save_interval'])  # TB超参数
+                  train_batch_size=64, save_interval=trainer_params['logging']['model_save_interval'],
+                  lambda_value=0.5, lambda_tb=1.0, lr_logZ=1e-3,
+                  k_backtrack=3, m_reconstruct=3, episode_steps=1)  # TB超参数
 
 logger_params = {  # 日志配置
     'log_file': {
@@ -68,7 +70,7 @@ def main():
     create_logger(**logger_params)  # 初始化日志器
     _print_config()  # 打印配置
 
-    if USE_CUDA:  # 设备设置（新API）
+    if USE_CUDA:
         import torch
         torch.set_default_device(f'cuda:{CUDA_DEVICE_NUM}')
         torch.set_default_dtype(torch.float32)
@@ -84,9 +86,12 @@ def main():
 
 def _set_debug_mode():
     global trainer_params, tb_cfg
-    trainer_params['epochs'] = 10  # 降低epoch
-    tb_cfg.train_batch_size = 8  # 降低batch
-    tb_cfg.save_interval = 5  # 频繁保存
+    trainer_params['epochs'] = 10
+    tb_cfg.train_batch_size = 8
+    tb_cfg.save_interval = 5
+    tb_cfg.k_backtrack = 2
+    tb_cfg.m_reconstruct = 2
+    tb_cfg.episode_steps = 1
 
 
 def _print_config():
