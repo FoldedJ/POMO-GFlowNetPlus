@@ -201,13 +201,14 @@ class TimeEstimator:
 
     def reset(self, count=1):
         self.start_time = time.time()
-        self.count_zero = count-1
+        self.count_zero = 0
 
     def get_est(self, count, total):
         curr_time = time.time()
         elapsed_time = curr_time - self.start_time
-        remain = total-count
-        remain_time = elapsed_time * remain / (count - self.count_zero)
+        remain = max(total - count, 0)
+        denom = max(count - self.count_zero, 1)
+        remain_time = elapsed_time * remain / denom
 
         elapsed_time /= 3600.0
         remain_time /= 3600.0
@@ -343,4 +344,3 @@ def copy_all_src(dst_root):
 
             # 复制文件
             shutil.copy(src_abspath, dst_filepath)
-

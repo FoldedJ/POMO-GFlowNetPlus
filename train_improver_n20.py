@@ -41,17 +41,18 @@ model_params = {  # 模型结构参数（与原POMO一致）
 trainer_params = {  # 训练流程参数
     'use_cuda': USE_CUDA,
     'cuda_device_num': CUDA_DEVICE_NUM,
-    'epochs': 100, # 1000
+    'epochs': 100,
     'logging': {
-        'model_save_interval': 10, # 100
+        'model_save_interval': 10,
         'img_save_file': 'style_loss_1.json'
     },
 }
 
 tb_cfg = TBConfig(temperature=1.0, lr=1e-4, weight_decay=1e-6,
-                  train_batch_size=64, save_interval=trainer_params['logging']['model_save_interval'],
+                  train_batch_size=16, save_interval=trainer_params['logging']['model_save_interval'],
                   lambda_value=0.5, lambda_tb=1.0, lr_logZ=1e-3,
-                  k_backtrack=3, m_reconstruct=3, episode_steps=1)  # TB超参数
+                  k_backtrack=2, m_reconstruct=2, episode_steps=1,
+                  train_episodes=64)
 
 logger_params = {  # 日志配置
     'log_file': {
@@ -86,12 +87,13 @@ def main():
 
 def _set_debug_mode():
     global trainer_params, tb_cfg
-    trainer_params['epochs'] = 10
-    tb_cfg.train_batch_size = 8
+    trainer_params['epochs'] = 100
+    tb_cfg.train_batch_size = 16
     tb_cfg.save_interval = 5
-    tb_cfg.k_backtrack = 2
-    tb_cfg.m_reconstruct = 2
+    tb_cfg.k_backtrack = 1
+    tb_cfg.m_reconstruct = 1
     tb_cfg.episode_steps = 1
+    tb_cfg.train_episodes = 256
 
 
 def _print_config():

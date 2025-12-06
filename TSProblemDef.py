@@ -1,11 +1,17 @@
 
 import torch
 import numpy as np
+from typing import Optional
 
 
-def get_random_problems(batch_size, problem_size):
+def get_random_problems(batch_size, problem_size, seed: Optional[int] = None):
+    if seed is not None:
+        try:
+            torch.manual_seed(int(seed))
+            torch.cuda.manual_seed_all(int(seed))
+        except Exception:
+            torch.manual_seed(int(seed))
     problems = torch.rand(size=(batch_size, problem_size, 2))
-    # problems.shape: (batch, problem, 2)
     return problems
 
 

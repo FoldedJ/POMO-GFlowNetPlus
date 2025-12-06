@@ -4,12 +4,12 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from improver.ImproverModelParts import SharedEncoder, compute_tour_length, compute_remaining_length, compute_suffix_lengths
 from improver.GFlowComponents import ValueNetwork, sample_backtrack_points, sample_reconstruction_candidates_for_point
 from TSProblemDef import get_random_problems
-from utils.utils import LogData, TimeEstimator, util_save_log_image_with_label
+from utils.utils import LogData, TimeEstimator, util_save_log_image_with_label, AverageMeter
 
 
 class TBConfig:
@@ -17,7 +17,9 @@ class TBConfig:
     def __init__(self, temperature: float = 1.0, lr: float = 1e-4, weight_decay: float = 1e-6,
                  train_batch_size: int = 64, save_interval: int = 1000,
                  lambda_value: float = 0.1, lambda_tb: float = 1.0, lr_logZ: float = 1e-3,
-                 k_backtrack: int = 3, m_reconstruct: int = 3, episode_steps: int = 1):
+                 k_backtrack: int = 3, m_reconstruct: int = 3, episode_steps: int = 1,
+                 train_episodes: int = 1000,
+                 seed: Optional[int] = None):
         self.temperature = temperature  # 温度参数
         self.lr = lr  # 学习率
         self.weight_decay = weight_decay  # 权重衰减（正则化）
@@ -28,7 +30,9 @@ class TBConfig:
         self.lr_logZ = lr_logZ  # 配分常数学习率
         self.k_backtrack = k_backtrack  # 回溯时考虑的候选数
         self.m_reconstruct = m_reconstruct  # 重构时考虑的候选数
-        self.episode_steps = episode_steps  # 每个episode的最大步数
+        self.episode_steps = episode_steps  # 每个episode的优化步数
+        self.train_episodes = train_episodes # 每个epoch的episode数
+        self.seed = seed
 
 
 class GFlowTBTrainer(nn.Module):
@@ -62,13 +66,14 @@ class GFlowTBTrainer(nn.Module):
         self.time_estimator = TimeEstimator()  # 训练时间估计
 
     def build_initial_tour(self, problems: torch.Tensor) -> torch.Tensor:
-        """
-        构造随机初始路径
-        """
         device = problems.device
         batch = problems.size(0)
         N = problems.size(1)
-        tours = torch.stack([torch.randperm(N, device=device) for _ in range(batch)], dim=0)
+        gen = None
+        if getattr(self.tb_cfg, 'seed', None) is not None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(self.tb_cfg.seed))
+        tours = torch.stack([torch.randperm(N, device=device, generator=gen) for _ in range(batch)], dim=0)
         return tours
     
 
@@ -76,6 +81,8 @@ class GFlowTBTrainer(nn.Module):
         """
         计算 TB 损失
         """
+        self.train()
+        self.optimizer.zero_grad()
         batch = problems.size(0)
         initial = self.build_initial_tour(problems) # 初始随机路径
         encoded_nodes = self.encoder(problems)
@@ -94,6 +101,7 @@ class GFlowTBTrainer(nn.Module):
         for _ in range(steps):
             # 抽样回溯点
             bt_idxs, bt_logprob_mat = sample_backtrack_points(problems, initial, self.value_net, k, self.tb_cfg.temperature)
+            bt_hist = torch.bincount(bt_idxs.reshape(-1), minlength=problems.size(1)).detach().cpu().tolist()
             
             candidates = [] # 重构候选路径
             cand_lengths = [] # 候选路径长度
@@ -113,7 +121,13 @@ class GFlowTBTrainer(nn.Module):
                 # 预测剩余路径长度
                 pred = self.value_net(problems, visited_mask, last_idx)
                 # 抽样重构点并重构
-                cand_tensor, recon_logprob_mat = sample_reconstruction_candidates_for_point(problems, initial, prefix_len, m, self.value_net, self.tb_cfg.temperature)
+                cand_tensor, recon_logprob_mat, recon_actions_mat = sample_reconstruction_candidates_for_point(problems, initial, prefix_len, m, self.value_net, self.tb_cfg.temperature)
+                cities = recon_actions_mat[:, :, 0].reshape(-1)
+                edges = recon_actions_mat[:, :, 1].reshape(-1)
+                city_mask = (cities >= 0)
+                edge_mask = (edges >= 0)
+                city_hist = torch.bincount(cities[city_mask], minlength=problems.size(1)).detach().cpu().tolist()
+                edge_hist = torch.bincount(edges[edge_mask], minlength=problems.size(1)).detach().cpu().tolist()
                 
                 # 针对每个候选路径计算损失
                 for j in range(m):
@@ -152,6 +166,8 @@ class GFlowTBTrainer(nn.Module):
         loss_tb = torch.stack(tb_list, dim=1).mean() if tb_list else torch.tensor(0.0, device=problems.device)
         value_loss = torch.stack(val_list).mean() if val_list else torch.tensor(0.0, device=problems.device)
         loss = self.tb_cfg.lambda_tb * loss_tb + self.tb_cfg.lambda_value * value_loss
+        loss.backward()
+        self.optimizer.step()
 
         return {
             'loss': loss,
@@ -161,29 +177,73 @@ class GFlowTBTrainer(nn.Module):
             'avg_logP': sum(avg_logP_list) / len(avg_logP_list),
             'avg_logR': sum(avg_logR_list) / len(avg_logR_list),
             'avg_adv': (sum(adv_list) / len(adv_list)) if adv_list else 0.0,
+            'bt_points_hist': bt_hist, # 回溯点分布
+            'recon_city_hist': city_hist, # 重构城市分布
+            'recon_edge_hist': edge_hist, # 重构边分布
+        }
+
+
+    def _train_one_epoch(self, epoch: int) -> Dict[str, float]:
+        loss_am = AverageMeter()
+        tb_am = AverageMeter()
+        val_am = AverageMeter()
+        len_am = AverageMeter()
+        logp_am = AverageMeter()
+        logr_am = AverageMeter()
+        adv_am = AverageMeter()
+        problem_size = self.model_params['problem_size']
+        bt_hist_accum = torch.zeros(problem_size, dtype=torch.long)
+        rc_city_hist_accum = torch.zeros(problem_size, dtype=torch.long)
+        rc_edge_hist_accum = torch.zeros(problem_size, dtype=torch.long)
+        train_num_episode = self.tb_cfg.train_episodes
+        
+        episode = 0
+        
+        while episode < train_num_episode:
+            remaining = train_num_episode - episode
+            batch_size = min(self.tb_cfg.train_batch_size, remaining)
+            problems = get_random_problems(batch_size, self.model_params['problem_size'], seed=self.tb_cfg.seed)
+            out = self.tb_loss_for_batch(problems)
+            loss_am.update(out['loss'].item(), batch_size)
+            tb_am.update(out['tb_loss'], batch_size)
+            val_am.update(out['value_loss'], batch_size)
+            len_am.update(out['avg_len'], batch_size)
+            logp_am.update(out['avg_logP'], batch_size)
+            logr_am.update(out['avg_logR'], batch_size)
+            adv_am.update(out.get('avg_adv', 0.0), batch_size)
+            if 'bt_points_hist' in out and isinstance(out['bt_points_hist'], list):
+                bt_hist_accum += torch.tensor(out['bt_points_hist'][:problem_size])
+            if 'recon_city_hist' in out and isinstance(out['recon_city_hist'], list):
+                rc_city_hist_accum += torch.tensor(out['recon_city_hist'][:problem_size])
+            if 'recon_edge_hist' in out and isinstance(out['recon_edge_hist'], list):
+                rc_edge_hist_accum += torch.tensor(out['recon_edge_hist'][:problem_size])
+            episode += batch_size
+        return {
+            'loss': loss_am.avg,
+            'tb_loss': tb_am.avg,
+            'value_loss': val_am.avg,
+            'avg_len': len_am.avg,
+            'avg_logP': logp_am.avg,
+            'avg_logR': logr_am.avg,
+            'avg_adv': adv_am.avg,
+            'bt_points_hist': bt_hist_accum.tolist(),
+            'recon_city_hist': rc_city_hist_accum.tolist(),
+            'recon_edge_hist': rc_edge_hist_accum.tolist(),
         }
 
     def run(self, save_dir: str, epochs: int, img_style_file: str = 'style_loss_1.json'):
 
         os.makedirs(save_dir, exist_ok=True)
         self.time_estimator.reset(epochs)
-        # 主训练循环：采样数据、前向-反向-更新、记录与保存
         for ep in range(1, epochs + 1):
-            problems = get_random_problems(self.tb_cfg.train_batch_size, self.model_params['problem_size'])
-            
-            self.train()
-            self.optimizer.zero_grad()
-            out = self.tb_loss_for_batch(problems)
-            out['loss'].backward()
-            self.optimizer.step()
-
-            self.result_log.append('train_loss', out['loss'].item())  # 记录训练指标
-            self.result_log.append('train_avg_len', out['avg_len'])
-            self.result_log.append('train_avg_logP', out['avg_logP'])
-            self.result_log.append('train_avg_logR', out['avg_logR'])
-            self.result_log.append('train_tb_loss', out['tb_loss'])
-            self.result_log.append('train_value_loss', out['value_loss'])
-            self.result_log.append('train_avg_adv', out.get('avg_adv', 0.0))
+            stats = self._train_one_epoch(ep)
+            self.result_log.append('train_loss', stats['loss'])
+            self.result_log.append('train_avg_len', stats['avg_len'])
+            self.result_log.append('train_avg_logP', stats['avg_logP'])
+            self.result_log.append('train_avg_logR', stats['avg_logR'])
+            self.result_log.append('train_tb_loss', stats['tb_loss'])
+            self.result_log.append('train_value_loss', stats['value_loss'])
+            self.result_log.append('train_avg_adv', stats.get('avg_adv', 0.0))
 
             if ep % self.tb_cfg.save_interval == 0:
                 ckpt = {
@@ -194,22 +254,20 @@ class GFlowTBTrainer(nn.Module):
                 }
                 torch.save(ckpt, os.path.join(save_dir, f'checkpoint-{ep}.pt'))
 
-            # 估算剩余时间并输出
             self.time_estimator.print_est_time(ep, epochs)
-            
-            # 追加详细训练日志到 run_log
             logger = logging.getLogger('root')
             logger.info(
-                "Epoch {}/{}: loss={:.6f}, tb_loss={:.6f}, value_loss={:.6f}, avg_len={:.6f}, avg_logP={:.6f}, avg_logR={:.6f}".format(
+                "Epoch {}/{}: loss={:.6f}, tb_loss={:.6f}, value_loss={:.6f}, avg_len={:.6f}, avg_logP={:.6f}, avg_logR={:.6f}, bt_hist={}, rc_city_hist={}, rc_edge_hist={}".format(
                     ep, epochs,
-                    out['loss'].item() if hasattr(out['loss'], 'item') else float(out['loss']),
-                    out.get('tb_loss', 0.0),
-                    out.get('value_loss', 0.0),
-                    out['avg_len'], out['avg_logP'], out['avg_logR']
+                    stats['loss'],
+                    stats['tb_loss'],
+                    stats['value_loss'],
+                    stats['avg_len'], stats['avg_logP'], stats['avg_logR'],
+                    stats.get('bt_points_hist', []),
+                    stats.get('recon_city_hist', []), stats.get('recon_edge_hist', [])
                 )
             )
 
-        # 训练结束后输出指标曲线图像
         util_save_log_image_with_label(
             result_file_prefix=os.path.join(save_dir, 'train'),
             img_params={'json_foldername': 'log_image_style', 'filename': img_style_file},

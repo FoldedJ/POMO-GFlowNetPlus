@@ -89,7 +89,7 @@ def sample_backtrack_points(problems: torch.Tensor, tour: torch.Tensor, value_ne
     # 计算回溯潜力 φ = 后缀真实长度 - 价值估计
     phi = suffix_len - pred_remaining
     probs = F.softmax(phi / max(temperature, 1e-6), dim=1)
-    idxs = torch.topk(probs, k=k, dim=1).indices
+    idxs = torch.multinomial(probs, num_samples=k, replacement=False)
     log_probs = torch.log(probs + 1e-12)
     return idxs, log_probs
 
@@ -141,15 +141,16 @@ def sample_reconstruction_candidates_for_point(problems: torch.Tensor, tour: tor
     batch = problems.size(0)
     problem = problems.size(1)
     
-    candidates = [] # 候选路径
+    candidates = []
+    actions_rows = []
     
     # 枚举每个样本
     for b in range(batch):
         L = int(prefix_len[b].item())
         suffix_cities = tour[b, L:] # 未访问城市集合 U
         
-        actions = [] # 插入动作(待插入城市u, 插入位置e_pos)
-        tours_b = [] # 生成的新路径
+        actions = []
+        tours_b = []
         
         # 枚举所有插入动作
         for u in suffix_cities.tolist(): # 枚举城市
@@ -159,9 +160,9 @@ def sample_reconstruction_candidates_for_point(problems: torch.Tensor, tour: tor
                 actions.append((u, e_pos))
                 tours_b.append(new_tour)
         
-        # 若无候选路径（如所有城市已访问），用原路径填充
         if len(tours_b) == 0:
             tours_b = [tour[b].clone()]
+            actions = [(-1, -1)]
         
         tours_stack = torch.stack(tours_b) # 所有 s_new 的集合
         # 构造价值网络的输入
@@ -172,14 +173,17 @@ def sample_reconstruction_candidates_for_point(problems: torch.Tensor, tour: tor
         v_pred = value_net(problems_rep, visited_mask, last_idx)
         phi = -v_pred
         probs = F.softmax(phi.unsqueeze(0) / max(temperature, 1e-6), dim=1)
-        probs_idx = torch.topk(probs, k=min(m, len(tours_b)), dim=1).indices.squeeze(0)
+        probs_idx = torch.multinomial(probs.squeeze(0), num_samples=min(m, len(tours_b)), replacement=False)
         chosen = tours_stack[probs_idx]
         candidates.append(chosen)
         chosen_log = torch.log(probs.squeeze(0)[probs_idx] + 1e-12)
+        chosen_actions = torch.tensor([actions[i] for i in probs_idx.tolist()], device=device, dtype=torch.long)
         if b == 0:
             logprob_rows = chosen_log.unsqueeze(0)
+            actions_rows = chosen_actions.unsqueeze(0)
         else:
             logprob_rows = torch.cat([logprob_rows, chosen_log.unsqueeze(0)], dim=0)
+            actions_rows = torch.cat([actions_rows, chosen_actions.unsqueeze(0)], dim=0)
 
     cand_tensor = torch.stack(candidates, dim=0)
-    return cand_tensor, logprob_rows
+    return cand_tensor, logprob_rows, actions_rows
