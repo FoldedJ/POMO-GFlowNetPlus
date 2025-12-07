@@ -18,8 +18,7 @@ class TBConfig:
                  train_batch_size: int = 64, save_interval: int = 1000,
                  lambda_value: float = 0.1, lambda_tb: float = 1.0, lr_logZ: float = 1e-3,
                  k_backtrack: int = 3, m_reconstruct: int = 3, episode_steps: int = 1,
-                 train_episodes: int = 1000,
-                 seed: Optional[int] = None):
+                 train_episodes: int = 1000):
         self.temperature = temperature  # 温度参数
         self.lr = lr  # 学习率
         self.weight_decay = weight_decay  # 权重衰减（正则化）
@@ -32,7 +31,6 @@ class TBConfig:
         self.m_reconstruct = m_reconstruct  # 重构时考虑的候选数
         self.episode_steps = episode_steps  # 每个episode的优化步数
         self.train_episodes = train_episodes # 每个epoch的episode数
-        self.seed = seed
 
 
 class GFlowTBTrainer(nn.Module):
@@ -69,11 +67,7 @@ class GFlowTBTrainer(nn.Module):
         device = problems.device
         batch = problems.size(0)
         N = problems.size(1)
-        gen = None
-        if getattr(self.tb_cfg, 'seed', None) is not None:
-            gen = torch.Generator(device=device)
-            gen.manual_seed(int(self.tb_cfg.seed))
-        tours = torch.stack([torch.randperm(N, device=device, generator=gen) for _ in range(batch)], dim=0)
+        tours = torch.stack([torch.randperm(N, device=device) for _ in range(batch)], dim=0)
         return tours
     
 
@@ -202,7 +196,7 @@ class GFlowTBTrainer(nn.Module):
         while episode < train_num_episode:
             remaining = train_num_episode - episode
             batch_size = min(self.tb_cfg.train_batch_size, remaining)
-            problems = get_random_problems(batch_size, self.model_params['problem_size'], seed=self.tb_cfg.seed)
+            problems = get_random_problems(batch_size, self.model_params['problem_size'], seed=None)
             out = self.tb_loss_for_batch(problems)
             loss_am.update(out['loss'].item(), batch_size)
             tb_am.update(out['tb_loss'], batch_size)
