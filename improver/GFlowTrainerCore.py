@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from typing import Dict, Any, Optional
 
 from improver.ImproverModelParts import SharedEncoder, compute_tour_length, compute_remaining_length, compute_suffix_lengths
-from improver.GFlowComponents import ValueNetwork, sample_backtrack_points, sample_reconstruction_candidates_for_point
+from improver.GFlowComponents import ValueNetwork, sample_backtrack_points, sample_reconstruction_by_edge_split
 from TSProblemDef import get_random_problems
 from utils.utils import LogData, TimeEstimator, util_save_log_image_with_label, AverageMeter
 
@@ -114,14 +114,15 @@ class GFlowTBTrainer(nn.Module):
                     last_idx[b] = pref[-1]
                 # 预测剩余路径长度
                 pred = self.value_net(problems, visited_mask, last_idx)
-                # 抽样重构点并重构
-                cand_tensor, recon_logprob_mat, recon_actions_mat = sample_reconstruction_candidates_for_point(problems, initial, prefix_len, m, self.value_net, self.tb_cfg.temperature)
-                cities = recon_actions_mat[:, :, 0].reshape(-1)
-                edges = recon_actions_mat[:, :, 1].reshape(-1)
-                city_mask = (cities >= 0)
-                edge_mask = (edges >= 0)
-                city_hist = torch.bincount(cities[city_mask], minlength=problems.size(1)).detach().cpu().tolist()
-                edge_hist = torch.bincount(edges[edge_mask], minlength=problems.size(1)).detach().cpu().tolist()
+                # 按照“拆边重插”进行重构候选采样
+                cand_tensor, recon_logprob_mat, recon_edge_idx_mat = sample_reconstruction_by_edge_split(
+                    problems, initial, bt_idxs[:, t], m, self.value_net, self.tb_cfg.temperature
+                )
+                # 直方统计：回溯城市与拆分边分布
+                bt_city = initial[torch.arange(batch), bt_idxs[:, t]]
+                city_hist = torch.bincount(bt_city, minlength=problems.size(1)).detach().cpu().tolist()
+                edges_flat = recon_edge_idx_mat.reshape(-1).clamp(min=0)
+                edge_hist = torch.bincount(edges_flat, minlength=problems.size(1)).detach().cpu().tolist()
                 
                 # 针对每个候选路径计算损失
                 for j in range(m):

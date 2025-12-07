@@ -4,7 +4,7 @@ import torch.nn as nn
 from typing import Dict, Any
 
 from improver.ImproverModelParts import SharedEncoder, compute_tour_length, compute_suffix_lengths
-from improver.GFlowComponents import ValueNetwork, OptimizationState, sample_backtrack_points, sample_reconstruction_candidates_for_point
+from improver.GFlowComponents import ValueNetwork, OptimizationState, sample_backtrack_points, sample_reconstruction_by_edge_split
 from TSProblemDef import augment_xy_data_by_8_fold
 
 
@@ -42,13 +42,12 @@ class GFlowImprover:
 
         if not self.use_augmentation:
             # 使用封装函数 sample_backtrack_points 进行回溯点选择
-            chosen_points = sample_backtrack_points(problems, initial_tour, self.value_net, self.k_backtrack, self.temperature)
+            bt_idxs, _ = sample_backtrack_points(problems, initial_tour, self.value_net, self.k_backtrack, self.temperature)
             
             candidates = [initial_tour]
             for t in range(self.k_backtrack):
-                point = chosen_points[:, t]
-                prefix_len = point + 1
-                cand, _ = sample_reconstruction_candidates_for_point(problems, initial_tour, prefix_len, self.m_reconstruct, self.value_net, self.temperature)
+                point = bt_idxs[:, t]
+                cand, _ , _ = sample_reconstruction_by_edge_split(problems, initial_tour, point, self.m_reconstruct, self.value_net, self.temperature)
                 for i in range(cand.size(1)):
                     candidates.append(cand[:, i, :])
             # 8) 计算所有候选的路径长度，并用共享基线选择优势最大的候选
@@ -66,13 +65,12 @@ class GFlowImprover:
             initial_aug = initial_tour.repeat(8, 1)
             aug_batch = problems_aug.size(0)
             
-            chosen_points = sample_backtrack_points(problems_aug, initial_aug, self.value_net, self.k_backtrack, self.temperature)
+            bt_idxs, _ = sample_backtrack_points(problems_aug, initial_aug, self.value_net, self.k_backtrack, self.temperature)
 
             candidates = [initial_aug]
             for t in range(self.k_backtrack):
-                point = chosen_points[:, t]
-                prefix_len = point + 1
-                cand, _ = sample_reconstruction_candidates_for_point(problems_aug, initial_aug, prefix_len, self.m_reconstruct, self.value_net, self.temperature)
+                point = bt_idxs[:, t]
+                cand, _ , _ = sample_reconstruction_by_edge_split(problems_aug, initial_aug, point, self.m_reconstruct, self.value_net, self.temperature)
                 for i in range(cand.size(1)):
                     candidates.append(cand[:, i, :])
             # 按原批次维度从 8 份增广候选中选优势最大的路径

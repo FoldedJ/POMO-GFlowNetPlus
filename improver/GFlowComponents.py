@@ -95,95 +95,78 @@ def sample_backtrack_points(problems: torch.Tensor, tour: torch.Tensor, value_ne
 
  
 
-def _apply_insertion_to_tour(tour: torch.Tensor, prefix_len: int, city: int, insert_after_pos: int) -> torch.Tensor:
-    """
-    重构操作
-    输入：
-      - tour: (problem,) 当前构造的路径
-      - prefix_len: 前缀长度 L
-      - city: 未访问城市索引 u
-      - insert_after_pos: 插入位置 e (当前前缀的边位置)
-    输出：
-      - new_tour: (problem,) 插入后的路径
-    """
-    problem = tour.size(0) # 城市总数
-    # 定位待插入城市city在原路径中的位置
-    pos = (tour == city).nonzero(as_tuple=False).squeeze(1)
-    pos_u = int(pos.item())
-    # 是否已访问城市u
-    if pos_u < prefix_len:
-        return tour.clone()
-    
-    insert_idx = max(prefix_len, min(insert_after_pos + 1, problem))
-    
-    if pos_u == insert_idx:
-        return tour.clone()
-    without = torch.cat([tour[:pos_u], tour[pos_u+1:]])
-    left = without[:insert_idx]
-    right = without[insert_idx:]
-    return torch.cat([left, torch.tensor([city], dtype=tour.dtype, device=tour.device), right])
 
-def sample_reconstruction_candidates_for_point(problems: torch.Tensor, tour: torch.Tensor, prefix_len: torch.Tensor, m: int, value_net: nn.Module, temperature: float = 1.0):
+def _apply_edge_split_reinsertion(tour: torch.Tensor, backtrack_pos: int, edge_idx: int) -> torch.Tensor:
+    """移除回溯点并通过拆分环路中的一条边将该点重新插入。
+    tour: (problem,)
+    backtrack_pos: 被移除的节点在 tour 中的位置
+    edge_idx: 在移除后环路中的边索引 [0..problem-2]，对应 (u,v) 为 (cycle[edge_idx], cycle[(edge_idx+1)%len])
+    返回: 新的包含该节点的 tour
     """
-    抽样重构点
+    N = tour.size(0)
+    node = int(tour[backtrack_pos].item())
+    # 构造移除后的环路
+    cycle = torch.cat([tour[:backtrack_pos], tour[backtrack_pos+1:]])  # (N-1)
+    L = cycle.size(0)
+    u_idx = int(edge_idx)
+    if u_idx < 0 or u_idx >= L:
+        u_idx = max(0, min(u_idx, L-1))
+    # 在 u 之后插入该节点
+    left = cycle[:u_idx+1]
+    right = cycle[u_idx+1:]
+    return torch.cat([left, torch.tensor([node], dtype=tour.dtype, device=tour.device), right])
+
+def sample_reconstruction_by_edge_split(problems: torch.Tensor,
+                                        tour: torch.Tensor,
+                                        backtrack_pos_batch: torch.Tensor,
+                                        m: int,
+                                        value_net: nn.Module,
+                                        temperature: float = 1.0):
+    """按照“拆边重插”策略为每个样本生成 m 条候选路径。
     输入：
-      - problems: (batch, problem, 2) 城市坐标
-      - tour: (batch, problem) 当前构造的路径
-      - prefix_len: (batch,) 前缀长度 L (已访问城市数)
-      - value_net: 价值网络
-      - m: 每个样本返回的候选路径数量
-      - temperature: 温度参数 τ
+      - problems: (batch, N, 2)
+      - tour: (batch, N)
+      - backtrack_pos_batch: (batch,) 选择的回溯点位置
+      - m: 候选数
     输出：
-      - cand_tensor: (batch, m, problem) 每个样本的 m 个候选重构路径
-      - logprob_rows: (batch, m) 对应候选路径的对数概率
+      - cand_tensor: (batch, m, N)
+      - logprob_rows: (batch, m)
+      - actions_rows: (batch, m) 边索引（0..N-2）
     """
     device = problems.device
     batch = problems.size(0)
-    problem = problems.size(1)
-    
+    N = problems.size(1)
     candidates = []
-    actions_rows = []
-    
-    # 枚举每个样本
+    logprob_rows = None
+    actions_rows = None
     for b in range(batch):
-        L = int(prefix_len[b].item())
-        suffix_cities = tour[b, L:] # 未访问城市集合 U
-        
-        actions = []
+        bp = int(backtrack_pos_batch[b].item())
+        # 枚举 (N-1) 条边（移除后的环路）
         tours_b = []
-        
-        # 枚举所有插入动作
-        for u in suffix_cities.tolist(): # 枚举城市
-            for e_pos in range(L-1, problem-1): # 枚举边
-                new_tour = _apply_insertion_to_tour(tour[b], L, int(u), e_pos)
-                
-                actions.append((u, e_pos))
-                tours_b.append(new_tour)
-        
-        if len(tours_b) == 0:
-            tours_b = [tour[b].clone()]
-            actions = [(-1, -1)]
-        
-        tours_stack = torch.stack(tours_b) # 所有 s_new 的集合
-        # 构造价值网络的输入
-        problems_rep = problems[b].unsqueeze(0).expand(tours_stack.size(0), problem, 2)
-        visited_mask = torch.ones(tours_stack.size(0), problem, dtype=torch.bool, device=device)
+        actions_b = []
+        for e_idx in range(N-1):
+            new_t = _apply_edge_split_reinsertion(tour[b], bp, e_idx)
+            tours_b.append(new_t)
+            actions_b.append(e_idx)
+        tours_stack = torch.stack(tours_b)  # (N-1, N)
+        # 评分与抽样
+        problems_rep = problems[b].unsqueeze(0).expand(tours_stack.size(0), N, 2)
+        visited_mask = torch.ones(tours_stack.size(0), N, dtype=torch.bool, device=device)
         last_idx = tours_stack[:, -1]
-        # 计算重构潜力 φ_F = -V(s_new)
         v_pred = value_net(problems_rep, visited_mask, last_idx)
         phi = -v_pred
-        probs = F.softmax(phi.unsqueeze(0) / max(temperature, 1e-6), dim=1)
-        probs_idx = torch.multinomial(probs.squeeze(0), num_samples=min(m, len(tours_b)), replacement=False)
-        chosen = tours_stack[probs_idx]
-        candidates.append(chosen)
-        chosen_log = torch.log(probs.squeeze(0)[probs_idx] + 1e-12)
-        chosen_actions = torch.tensor([actions[i] for i in probs_idx.tolist()], device=device, dtype=torch.long)
+        probs = F.softmax(phi / max(temperature, 1e-6), dim=0)
+        num = min(m, tours_stack.size(0))
+        chosen_idx = torch.multinomial(probs, num_samples=num, replacement=False)
+        chosen_tours = tours_stack[chosen_idx]
+        candidates.append(chosen_tours)
+        chosen_log = torch.log(probs[chosen_idx] + 1e-12)
+        chosen_actions = torch.tensor([actions_b[i] for i in chosen_idx.tolist()], device=device, dtype=torch.long)
         if b == 0:
             logprob_rows = chosen_log.unsqueeze(0)
             actions_rows = chosen_actions.unsqueeze(0)
         else:
             logprob_rows = torch.cat([logprob_rows, chosen_log.unsqueeze(0)], dim=0)
             actions_rows = torch.cat([actions_rows, chosen_actions.unsqueeze(0)], dim=0)
-
     cand_tensor = torch.stack(candidates, dim=0)
     return cand_tensor, logprob_rows, actions_rows
