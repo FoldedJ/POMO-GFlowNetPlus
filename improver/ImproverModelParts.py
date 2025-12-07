@@ -14,9 +14,11 @@ class SharedEncoder(nn.Module):
         super().__init__()
         self.model_params = model_params
         embedding_dim = self.model_params['embedding_dim']
+        problem_size = self.model_params['problem_size']
         encoder_layer_num = self.model_params['encoder_layer_num']
 
         self.embedding = nn.Linear(2, embedding_dim)  # 将坐标(2维)映射到嵌入空间
+        self.pos_embedding = nn.Embedding(problem_size, embedding_dim)
         self.layers = nn.ModuleList([EncoderLayer(**model_params) for _ in range(encoder_layer_num)])  # 堆叠若干编码层
 
     def forward(self, data):
@@ -24,6 +26,10 @@ class SharedEncoder(nn.Module):
         if data.dim() != 3 or data.size(-1) != 2:
             raise ValueError("problems tensor must be (batch, problem, 2)")
         embedded_input = self.embedding(data)  # 逐城市坐标编码
+        batch, problem = data.size(0), data.size(1)
+        pos = torch.arange(problem, device=data.device).unsqueeze(0).expand(batch, problem)
+        pos_embed = self.pos_embedding(pos)
+        embedded_input = embedded_input + pos_embed
         out = embedded_input
         for layer in self.layers:  # 逐层进行自注意力与前馈
             out = layer(out)
