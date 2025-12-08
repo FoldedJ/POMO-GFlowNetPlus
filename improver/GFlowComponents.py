@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from improver.ImproverModelParts import SharedEncoder, compute_tour_length, compute_suffix_lengths
 
 class OptimizationState:
@@ -35,10 +36,7 @@ class ValueNetwork(nn.Module):
         super().__init__()
         self.encoder = shared_encoder
         D = self.encoder.model_params['embedding_dim']
-        N = self.encoder.model_params['problem_size']
         self.pool = nn.AdaptiveAvgPool1d(1)
-        self.last_pos_emb = nn.Embedding(N, D)
-        self.step_emb = nn.Embedding(N + 1, D)
         self.head = nn.Sequential(
             nn.Linear(D, 64),
             nn.ReLU(),
@@ -51,11 +49,20 @@ class ValueNetwork(nn.Module):
         batch, problem_size, _ = problems.shape
         node_embed = self.encoder(problems)              # (batch, N, D)
         x = node_embed.transpose(1, 2)                  # (batch, D, N)
-        pooled = self.pool(x)                           # (batch, D, 1)
-        global_ctx = pooled.squeeze(2)                  # (batch, D)
+        pooled = self.pool(x)
+        global_ctx = pooled.squeeze(2)
+        dim = self.encoder.model_params['embedding_dim']
+        div_term = torch.exp(torch.arange(0, dim, 2, device=problems.device) * (-math.log(10000.0) / dim))
         step_ids = visited_mask.sum(dim=1).long().clamp(min=0, max=problem_size)
-        step_ctx = self.step_emb(step_ids)
-        last_ctx = self.last_pos_emb(last_idx.long().clamp(min=0, max=problem_size-1))
+        step_angles = step_ids.unsqueeze(1) * div_term
+        step_ctx = torch.zeros(batch, dim, device=problems.device)
+        step_ctx[:, 0::2] = torch.sin(step_angles)
+        step_ctx[:, 1::2] = torch.cos(step_angles)
+        last_ids = last_idx.long().clamp(min=0, max=problem_size-1)
+        last_angles = last_ids.unsqueeze(1) * div_term
+        last_ctx = torch.zeros(batch, dim, device=problems.device)
+        last_ctx[:, 0::2] = torch.sin(last_angles)
+        last_ctx[:, 1::2] = torch.cos(last_angles)
         global_ctx = global_ctx + step_ctx + last_ctx
         pred = self.head(global_ctx).squeeze(1)         # (batch,)
         return pred

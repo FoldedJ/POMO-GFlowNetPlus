@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 
 class SharedEncoder(nn.Module):
@@ -17,18 +18,22 @@ class SharedEncoder(nn.Module):
         problem_size = self.model_params['problem_size']
         encoder_layer_num = self.model_params['encoder_layer_num']
 
-        self.embedding = nn.Linear(2, embedding_dim)  # 将坐标(2维)映射到嵌入空间
-        self.pos_embedding = nn.Embedding(problem_size, embedding_dim)
-        self.layers = nn.ModuleList([EncoderLayer(**model_params) for _ in range(encoder_layer_num)])  # 堆叠若干编码层
+        self.embedding = nn.Linear(2, embedding_dim)
+        self.layers = nn.ModuleList([EncoderLayer(**model_params) for _ in range(encoder_layer_num)])
 
     def forward(self, data):
         """Input: (batch, problem, 2) -> Output: (batch, problem, embedding_dim)"""
         if data.dim() != 3 or data.size(-1) != 2:
             raise ValueError("problems tensor must be (batch, problem, 2)")
-        embedded_input = self.embedding(data)  # 逐城市坐标编码
+        embedded_input = self.embedding(data)
         batch, problem = data.size(0), data.size(1)
-        pos = torch.arange(problem, device=data.device).unsqueeze(0).expand(batch, problem)
-        pos_embed = self.pos_embedding(pos)
+        dim = self.model_params['embedding_dim']
+        position = torch.arange(problem, device=data.device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2, device=data.device) * (-math.log(10000.0) / dim))
+        pe = torch.zeros(problem, dim, device=data.device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pos_embed = pe.unsqueeze(0).expand(batch, problem, dim)
         embedded_input = embedded_input + pos_embed
         out = embedded_input
         for layer in self.layers:  # 逐层进行自注意力与前馈
