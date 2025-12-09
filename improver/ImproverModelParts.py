@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 
 class SharedEncoder(nn.Module):
@@ -15,29 +14,31 @@ class SharedEncoder(nn.Module):
         super().__init__()
         self.model_params = model_params
         embedding_dim = self.model_params['embedding_dim']
-        problem_size = self.model_params['problem_size']
         encoder_layer_num = self.model_params['encoder_layer_num']
 
-        self.embedding = nn.Linear(2, embedding_dim)
-        self.layers = nn.ModuleList([EncoderLayer(**model_params) for _ in range(encoder_layer_num)])
+        self.embedding = nn.Linear(2, embedding_dim)  # 将坐标(2维)映射到嵌入空间
+        self.layers = nn.ModuleList([EncoderLayer(**model_params) for _ in range(encoder_layer_num)])  # 堆叠若干编码层
 
-    def forward(self, data):
+    def forward(self, data, rank2_ninf_mask=None, rank3_ninf_mask=None):
         """Input: (batch, problem, 2) -> Output: (batch, problem, embedding_dim)"""
         if data.dim() != 3 or data.size(-1) != 2:
             raise ValueError("problems tensor must be (batch, problem, 2)")
         embedded_input = self.embedding(data)
-        batch, problem = data.size(0), data.size(1)
-        dim = self.model_params['embedding_dim']
-        position = torch.arange(problem, device=data.device).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim, 2, device=data.device) * (-math.log(10000.0) / dim))
-        pe = torch.zeros(problem, dim, device=data.device)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pos_embed = pe.unsqueeze(0).expand(batch, problem, dim)
-        embedded_input = embedded_input + pos_embed
         out = embedded_input
-        for layer in self.layers:  # 逐层进行自注意力与前馈
-            out = layer(out)
+        for layer in self.layers:
+            out = layer(out, rank2_ninf_mask=rank2_ninf_mask, rank3_ninf_mask=rank3_ninf_mask)
+        return out
+
+    # 用embedding后的编码计算
+    def encode_from_embeddings(self, embedded_input: torch.Tensor, rank2_ninf_mask=None, rank3_ninf_mask=None) -> torch.Tensor:
+        """Run transformer layers on precomputed embeddings; supports masks.
+        embedded_input: (batch, problem, embedding_dim)
+        """
+        if embedded_input.dim() != 3 or embedded_input.size(-1) != self.model_params['embedding_dim']:
+            raise ValueError("embedded_input must be (batch, problem, embedding_dim)")
+        out = embedded_input
+        for layer in self.layers:
+            out = layer(out, rank2_ninf_mask=rank2_ninf_mask, rank3_ninf_mask=rank3_ninf_mask)
         return out
 
 
@@ -58,16 +59,16 @@ class EncoderLayer(nn.Module):
         self.feedForward = FeedForward(**model_params)
         self.addAndNormalization2 = AddAndNorm(**model_params)
 
-    def forward(self, input1):
+    def forward(self, input1, rank2_ninf_mask=None, rank3_ninf_mask=None):
         head_num = self.model_params['head_num']
         q = reshape_by_heads(self.Wq(input1), head_num=head_num)
         k = reshape_by_heads(self.Wk(input1), head_num=head_num)
         v = reshape_by_heads(self.Wv(input1), head_num=head_num)
-        out_concat = multi_head_attention(q, k, v)  # 自注意力
+        out_concat = multi_head_attention(q, k, v, rank2_ninf_mask=rank2_ninf_mask, rank3_ninf_mask=rank3_ninf_mask)
         multi_head_out = self.multi_head_combine(out_concat)
-        out1 = self.addAndNormalization1(input1, multi_head_out)  # 残差+归一化
-        out2 = self.feedForward(out1)  # 前馈网络
-        out3 = self.addAndNormalization2(out1, out2)  # 残差+归一化
+        out1 = self.addAndNormalization1(input1, multi_head_out)
+        out2 = self.feedForward(out1)
+        out3 = self.addAndNormalization2(out1, out2)
         return out3
 
 def reshape_by_heads(qkv, head_num):
@@ -101,18 +102,18 @@ def multi_head_attention(q, k, v, rank2_ninf_mask=None, rank3_ninf_mask=None):
 
 
 class AddAndNorm(nn.Module):
-    """Residual add + InstanceNorm; keeps embedding_dim; no shape change except norm axes"""
+    """Residual add + InstanceNorm; keeps embedding_dim; no shape change except norm axes
+    改为了LayerNorm，原为InstanceNorm
+    """
     def __init__(self, **model_params):
         super().__init__()
         embedding_dim = model_params['embedding_dim']
-        self.norm = nn.InstanceNorm1d(embedding_dim, affine=True, track_running_stats=False)
+        self.norm = nn.LayerNorm(embedding_dim)
 
     def forward(self, input1, input2):
-        added = input1 + input2  # 残差相加
-        transposed = added.transpose(1, 2)
-        normalized = self.norm(transposed)  # 通道维归一化
-        back_trans = normalized.transpose(1, 2)
-        return back_trans
+        added = input1 + input2
+        normalized = self.norm(added)
+        return normalized
 
 
 class FeedForward(nn.Module):
@@ -179,24 +180,16 @@ def compute_remaining_length(problems: torch.Tensor, tours: torch.Tensor, prefix
 
 def compute_suffix_lengths(problems: torch.Tensor, tours: torch.Tensor) -> torch.Tensor:
     """
-    计算每个节点到路径结束的距离
+    计算从当前城市到路径结束的距离
     problems: (batch, problem, 2)
     tours: (batch, problem) 每个元素为城市索引
     返回: (batch, problem) 每个城市到路径结束的距离
     """
-    batch = problems.size(0)
-    problem_size = problems.size(1)
-    
-    # 根据tour重新排列城市坐标
-    gathering_index = tours.unsqueeze(2).expand(batch, problem_size, 2)
-    ordered_seq = problems.gather(dim=1, index=gathering_index)
-    # 计算欧式距离
-    rolled_seq = ordered_seq.roll(dims=1, shifts=-1)
-    segment_lengths = ((ordered_seq - rolled_seq) ** 2).sum(2).sqrt()  # (batch, problem)
-    # 反转累加得到后缀距离
-    reversed_lengths = segment_lengths.flip(dims=[1])
-    reversed_cumsum = reversed_lengths.cumsum(dim=1)
-    suffix = reversed_cumsum.flip(dims=[1])
-    
-    return suffix
-
+    batch, problem_size, _ = problems.shape
+    # 构造含坐标的路径信息
+    idx = tours.unsqueeze(2).expand(batch, problem_size, 2)
+    ordered = problems.gather(1, idx)
+    # 终点
+    last = ordered[:, -1, :].unsqueeze(1).expand(batch, problem_size, 2)
+    dist = ((ordered - last) ** 2).sum(2).sqrt()
+    return dist

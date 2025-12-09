@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Any, Optional
 
-from improver.ImproverModelParts import SharedEncoder, compute_tour_length, compute_remaining_length, compute_suffix_lengths
+from improver.ImproverModelParts import SharedEncoder, compute_tour_length, compute_remaining_length
 from improver.GFlowComponents import ValueNetwork, sample_backtrack_points, sample_reconstruction_by_edge_split
 from TSProblemDef import get_random_problems
 from utils.utils import LogData, TimeEstimator, util_save_log_image_with_label, AverageMeter
@@ -79,7 +79,7 @@ class GFlowTBTrainer(nn.Module):
         self.optimizer.zero_grad()
         batch = problems.size(0)
         initial = self.build_initial_tour(problems) # 初始随机路径
-        encoded_nodes = self.encoder(problems)
+        
         # 读取参数
         k = self.tb_cfg.k_backtrack
         m = self.tb_cfg.m_reconstruct
@@ -112,8 +112,7 @@ class GFlowTBTrainer(nn.Module):
                     pref = initial[b, :pl]
                     visited_mask[b, pref] = True
                     last_idx[b] = pref[-1]
-                # 预测剩余路径长度
-                pred = self.value_net(problems, visited_mask, last_idx)
+                pred = self.value_net(problems, tour=initial, mask=visited_mask)
                 # 按照“拆边重插”进行重构候选采样
                 cand_tensor, recon_logprob_mat, recon_edge_idx_mat = sample_reconstruction_by_edge_split(
                     problems, initial, bt_idxs[:, t], m, self.value_net, self.tb_cfg.temperature
