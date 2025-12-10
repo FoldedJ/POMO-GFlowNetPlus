@@ -49,7 +49,7 @@ trainer_params = {  # 训练流程参数
 }
 
 tb_cfg = TBConfig(temperature=1.0, lr=1e-4, weight_decay=1e-6,
-                  train_batch_size=16, save_interval=trainer_params['logging']['model_save_interval'],
+                  train_batch_size=64, save_interval=trainer_params['logging']['model_save_interval'],
                   lambda_value=0.5, lambda_tb=1.0, lr_logZ=1e-3,
                   k_backtrack=2, m_reconstruct=2, episode_steps=1,
                   train_episodes=64)
