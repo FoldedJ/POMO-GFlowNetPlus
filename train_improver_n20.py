@@ -19,7 +19,7 @@ sys.path.insert(0, "../..")
 # import
 
 import logging
-from utils.utils import create_logger
+from utils.utils import create_logger, get_result_folder
 
 from improver.GFlowTrainerCore import GFlowTBTrainer, TBConfig
 
@@ -81,7 +81,7 @@ def main():
         torch.set_default_dtype(torch.float32)
 
     trainer = GFlowTBTrainer(model_params=model_params, tb_cfg=tb_cfg)  # 构建训练器
-    save_dir = os.path.join('./result', 'improver_tsp20_tb')  # 模型与曲线保存目录
+    save_dir = get_result_folder()
     trainer.run(save_dir=save_dir, epochs=trainer_params['epochs'], img_style_file=trainer_params['logging']['img_save_file'])  # 开始训练
 
 
