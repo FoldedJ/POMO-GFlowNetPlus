@@ -71,14 +71,15 @@ class GFlowTBTrainer(nn.Module):
         return tours
     
 
-    def tb_loss_for_batch(self, problems: torch.Tensor) -> Dict[str, Any]:
+    def tb_loss_for_batch(self, problems: torch.Tensor, initial: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
         计算 TB 损失
         """
         self.train()
         self.optimizer.zero_grad()
         batch = problems.size(0)
-        initial = self.build_initial_tour(problems) # 初始随机路径
+        if initial is None:
+            initial = self.build_initial_tour(problems)
         
         # 读取参数
         k = self.tb_cfg.k_backtrack
@@ -174,6 +175,7 @@ class GFlowTBTrainer(nn.Module):
             'bt_points_hist': bt_hist, # 回溯点分布
             'recon_city_hist': city_hist, # 重构城市分布
             'recon_edge_hist': edge_hist, # 重构边分布
+            'initial': initial,
         }
 
 
@@ -190,14 +192,11 @@ class GFlowTBTrainer(nn.Module):
         rc_city_hist_accum = torch.zeros(problem_size, dtype=torch.long)
         rc_edge_hist_accum = torch.zeros(problem_size, dtype=torch.long)
         train_num_episode = self.tb_cfg.train_episodes
-        
-        episode = 0
-        
-        while episode < train_num_episode:
-            remaining = train_num_episode - episode
-            batch_size = min(self.tb_cfg.train_batch_size, remaining)
-            problems = get_random_problems(batch_size, self.model_params['problem_size'], seed=None)
-            out = self.tb_loss_for_batch(problems)
+        problems = get_random_problems(self.tb_cfg.train_batch_size, self.model_params['problem_size'], seed=None)
+        initial = self.build_initial_tour(problems)
+        for _ in range(train_num_episode):
+            out = self.tb_loss_for_batch(problems, initial=initial)
+            batch_size = problems.size(0)
             loss_am.update(out['loss'].item(), batch_size)
             tb_am.update(out['tb_loss'], batch_size)
             val_am.update(out['value_loss'], batch_size)
@@ -211,7 +210,7 @@ class GFlowTBTrainer(nn.Module):
                 rc_city_hist_accum += torch.tensor(out['recon_city_hist'][:problem_size])
             if 'recon_edge_hist' in out and isinstance(out['recon_edge_hist'], list):
                 rc_edge_hist_accum += torch.tensor(out['recon_edge_hist'][:problem_size])
-            episode += batch_size
+            initial = out.get('initial', initial)
         return {
             'loss': loss_am.avg,
             'tb_loss': tb_am.avg,
