@@ -98,64 +98,54 @@ class GFlowTBTrainer(nn.Module):
             bt_idxs, bt_logprob_mat = sample_backtrack_points(problems, initial, self.value_net, k, self.tb_cfg.temperature)
             bt_hist = torch.bincount(bt_idxs.reshape(-1), minlength=problems.size(1)).detach().cpu().tolist()
             
-            candidates = [] # 重构候选路径
-            cand_lengths = [] # 候选路径长度
-            # 遍历每个回溯点，生成重构候选路径
-            for t in range(k):
-                # 前缀长度（已访问城市数）
-                prefix_len = bt_idxs[:, t] + 1
-                device = problems.device
-                # 构造价值网络输入
-                visited_mask = torch.zeros(batch, problems.size(1), dtype=torch.bool, device=device)
-                last_idx = torch.zeros(batch, dtype=torch.long, device=device)      
-                for b in range(batch):
-                    pl = prefix_len[b].item()
+            device = problems.device
+            prefix_len = bt_idxs + 1
+            visited_mask = torch.zeros(batch, k, problems.size(1), dtype=torch.bool, device=device)
+            last_idx = torch.zeros(batch, k, dtype=torch.long, device=device)
+            for b in range(batch):
+                for t in range(k):
+                    pl = prefix_len[b, t].item()
                     pref = initial[b, :pl]
-                    visited_mask[b, pref] = True
-                    last_idx[b] = pref[-1]
-                pred = self.value_net(problems, tour=initial, mask=visited_mask)
-                # 按照“拆边重插”进行重构候选采样
-                cand_tensor, recon_logprob_mat, recon_edge_idx_mat = sample_reconstruction_by_edge_split(
-                    problems, initial, bt_idxs[:, t], m, self.value_net, self.tb_cfg.temperature
-                )
-                # 直方统计：回溯城市与拆分边分布
-                bt_city = initial[torch.arange(batch), bt_idxs[:, t]]
-                city_hist = torch.bincount(bt_city, minlength=problems.size(1)).detach().cpu().tolist()
-                edges_flat = recon_edge_idx_mat.reshape(-1).clamp(min=0)
-                edge_hist = torch.bincount(edges_flat, minlength=problems.size(1)).detach().cpu().tolist()
-                
-                # 针对每个候选路径计算损失
-                for j in range(m):
-                    recon_tour = cand_tensor[:, j, :]
-                    lengths = compute_tour_length(problems, recon_tour)
-                    log_R = -lengths
-                    log_pb = bt_logprob_mat[torch.arange(batch), bt_idxs[:, t]]
-                    log_pf = recon_logprob_mat[:, j]
-                    # 计算 TB 损失
-                    tb = (self.logZ + log_pf - log_R - log_pb) ** 2
-                    # 价值网络MSE损失
-                    remaining = compute_remaining_length(problems, recon_tour, prefix_len)
-                    v_loss = F.mse_loss(pred, remaining.detach())
-                    
-                    tb_list.append(tb)
-                    val_list.append(v_loss)
-                    avg_len_list.append(lengths.mean().item())
-                    avg_logP_list.append((log_pf - log_pb).mean().item())
-                    avg_logR_list.append(log_R.mean().item())
-                    candidates.append(recon_tour)
-                    cand_lengths.append(lengths)
-            # 计算优势并更新初始路径
-            if candidates:
-                C = len(candidates) # 候选路径总数（k×m）
-                cand_stack = torch.stack(candidates, dim=0) # (C, batch, N) → 所有候选路径
-                len_stack = torch.stack(cand_lengths, dim=1) # (batch, C) → 每个样本的所有候选长度
-                b_shared = len_stack.mean(dim=1) # (batch,) → 共享基线
-                # 优势
-                A = b_shared.unsqueeze(1) - len_stack
-                adv_list.append(A.mean().item())
-                # 选最优并更新初始路径
-                best_idx = torch.argmax(A, dim=1)
-                initial = cand_stack[best_idx, torch.arange(batch), :]
+                    visited_mask[b, t, pref] = True
+                    last_idx[b, t] = pref[-1]
+            problems_k = problems.unsqueeze(1).expand(batch, k, problems.size(1), 2).reshape(batch * k, problems.size(1), 2)
+            tour_k = initial.unsqueeze(1).expand(batch, k, problems.size(1)).reshape(batch * k, problems.size(1))
+            pred_k = self.value_net(problems_k, tour=tour_k, mask=visited_mask.reshape(batch * k, problems.size(1))).reshape(batch, k)
+            cand_tensor, recon_logprob_mat, recon_edge_idx_mat = sample_reconstruction_by_edge_split(
+                problems, initial, bt_idxs, m, self.value_net, self.tb_cfg.temperature
+            )
+            bt_city = initial[torch.arange(batch, device=device).unsqueeze(1).expand(batch, k), bt_idxs]
+            city_hist = torch.bincount(bt_city.reshape(-1), minlength=problems.size(1)).detach().cpu().tolist()
+            edges_flat = recon_edge_idx_mat.reshape(-1).clamp(min=0)
+            edge_hist = torch.bincount(edges_flat, minlength=problems.size(1)).detach().cpu().tolist()
+
+            Bkm = batch * k * m
+            recon_tours_flat = cand_tensor.reshape(Bkm, problems.size(1))
+            problems_flat = problems.unsqueeze(1).unsqueeze(1).expand(batch, k, m, problems.size(1), 2).reshape(Bkm, problems.size(1), 2)
+            lengths_flat = compute_tour_length(problems_flat, recon_tours_flat)
+            lengths = lengths_flat.view(batch, k, m)
+            log_R = -lengths
+            log_pb_k = bt_logprob_mat[torch.arange(batch, device=device).unsqueeze(1).expand(batch, k), bt_idxs]
+            log_pb_row = log_pb_k.unsqueeze(2).expand(batch, k, m)
+            log_pf = recon_logprob_mat
+            tb_km = (self.logZ + log_pf - log_R - log_pb_row) ** 2
+            remaining_flat = compute_remaining_length(
+                problems_flat, recon_tours_flat, prefix_len.unsqueeze(2).expand(batch, k, m).reshape(Bkm)
+            ).view(batch, k, m)
+            v_loss_step = ((pred_k.unsqueeze(2) - remaining_flat.detach()) ** 2).mean()
+            tb_list.append(tb_km.mean(dim=(1, 2)))
+            val_list.append(v_loss_step)
+            avg_len_list.append(lengths.mean().item())
+            avg_logP_list.append((log_pf - log_pb_row).mean().item())
+            avg_logR_list.append(log_R.mean().item())
+
+            cand_stack = cand_tensor.reshape(batch, k * m, problems.size(1)).permute(1, 0, 2)
+            len_stack = lengths.reshape(batch, k * m)
+            b_shared = len_stack.mean(dim=1)
+            A = b_shared.unsqueeze(1) - len_stack
+            adv_list.append(A.mean().item())
+            best_idx = torch.argmax(A, dim=1)
+            initial = cand_stack[best_idx, torch.arange(batch, device=device), :]
 
         # 汇总损失
         loss_tb = torch.stack(tb_list, dim=1).mean() if tb_list else torch.tensor(0.0, device=problems.device)

@@ -101,57 +101,56 @@ def sample_backtrack_points(problems: torch.Tensor, tour: torch.Tensor, value_ne
     log_probs = torch.log(probs + 1e-12)
     return idxs, log_probs
 
-
 def sample_reconstruction_by_edge_split(problems: torch.Tensor, tour: torch.Tensor, backtrack_pos_batch: torch.Tensor, m: int, value_net: nn.Module, temperature: float = 1.0):
-    """重构（批内全并行）
+    """重构
     输入：
-      - problems: (batch, problem, 2)
-      - tour: (batch, problem)
-      - backtrack_pos_batch: (batch,) 选择的回溯点位置
+      - problems: (batch, problem, 2) 城市坐标
+      - tour: (batch, problem) 当前构造的路径
+      - backtrack_pos_batch: (batch, k) 选择的回溯点位置
       - m: 候选数
     输出：
-      - cand_tensor: (batch, m, problem)
-      - logprob_rows: (batch, m)
-      - actions_rows: (batch, m) 边索引（0..problem-2）
+      - cand_tensor: (batch, k, m, problem) 所有候选路径
+      - logprob_rows: (batch, k, m) 对应候选路径的对数概率
+      - actions_rows: (batch, k, m) 边索引（0..problem-2）
     """
     device = problems.device
     batch, problem, _ = problems.shape
-
-    # 构造移除回溯点后的环路：cycle (batch, problem-1)
-    mask = torch.ones(batch, problem, dtype=torch.bool, device=device)
-    mask[torch.arange(batch, device=device), backtrack_pos_batch.long()] = False
-    cycle = tour[mask].view(batch, problem - 1)
-    # 回溯点索引
-    nodes = tour[torch.arange(batch, device=device), backtrack_pos_batch.long()].view(batch, 1)
-
-    # 生成所有候选 (batch, problem-1, problem)
+    # 扩展回溯点位置为 (batch, k)
+    if backtrack_pos_batch.dim() == 1:
+        backtrack_pos_batch = backtrack_pos_batch.view(batch, 1)
+    k = backtrack_pos_batch.size(1)
+    # 拆分环路和回溯点
+    mask = torch.ones(batch, k, problem, dtype=torch.bool, device=device)
+    arange_b = torch.arange(batch, device=device).unsqueeze(1).expand(batch, k)
+    arange_k = torch.arange(k, device=device).unsqueeze(0).expand(batch, k)
+    mask[arange_b, arange_k, backtrack_pos_batch.long()] = False
+    tour_exp = tour.unsqueeze(1).expand(batch, k, problem)
+    cycle = tour_exp[mask].view(batch, k, problem - 1) # 不包含回溯点的环路
+    nodes = tour_exp.gather(2, backtrack_pos_batch.long().unsqueeze(-1)) # 回溯点
+    # 构造重构后的候选路径
     all_candidates = []
     for e_idx in range(problem - 1):
-        left = cycle[:, :e_idx + 1]
-        right = cycle[:, e_idx + 1:]
-        new_t = torch.cat([left, nodes, right], dim=1)
-        all_candidates.append(new_t)  # (batch, problem)
-    candidates_stack = torch.stack(all_candidates, dim=1)  # (batch, problem-1, problem)
-
-    # 评分（一次性前向）：展平到 (batch*(problem-1), problem)
-    flat_tours = candidates_stack.reshape(batch * (problem - 1), problem)
-    flat_probs = problems.unsqueeze(1).expand(batch, problem - 1, problem, 2).reshape(batch * (problem - 1), problem, 2)
-    v_pred = value_net(flat_probs, tour=flat_tours, mask=None).reshape(batch, problem - 1)
-
-    # φ = -V(s_new)，按候选维度 softmax
+        left = cycle[:, :, :e_idx + 1]
+        right = cycle[:, :, e_idx + 1:]
+        new_t = torch.cat([left, nodes, right], dim=2)
+        all_candidates.append(new_t)
+    candidates_stack = torch.stack(all_candidates, dim=2)
+    # 展平，估算价值
+    flat_tours = candidates_stack.reshape(batch * k * (problem - 1), problem)
+    flat_probs = problems.unsqueeze(1).unsqueeze(1).expand(batch, k, problem - 1, problem, 2).reshape(batch * k * (problem - 1), problem, 2)
+    v_pred = value_net(flat_probs, tour=flat_tours, mask=None).reshape(batch, k, problem - 1)
+    # 计算重构潜力 φ = -V(s_new)
     phi = -v_pred
-    probs = F.softmax(phi / max(temperature, 1e-6), dim=1)  # (batch, problem-1)
+    probs = F.softmax(phi / max(temperature, 1e-6), dim=2)
 
-    # 每个样本选择 m 个候选
     num = min(m, problem - 1)
-    _, chosen_idx = torch.topk(probs, k=num, dim=1, largest=True, sorted=True)  # (batch, m)
+    _, chosen_idx = torch.topk(probs, k=num, dim=2, largest=True, sorted=True)
 
-    # 取出所选候选路径
-    arange_b = torch.arange(batch, device=device).unsqueeze(1).expand(batch, num)
-    chosen_tours = candidates_stack[arange_b, chosen_idx, :]  # (batch, m, problem)
+    idx_b = torch.arange(batch, device=device).view(batch, 1, 1).expand(batch, k, num)
+    idx_k = torch.arange(k, device=device).view(1, k, 1).expand(batch, k, num)
+    chosen_tours = candidates_stack[idx_b, idx_k, chosen_idx, :]
 
-    # 对数概率与边索引
-    chosen_log = torch.log(probs.gather(1, chosen_idx) + 1e-12)  # (batch, m)
-    actions_rows = chosen_idx.clone()  # (batch, m)
+    chosen_log = torch.log(probs.gather(2, chosen_idx) + 1e-12)
+    actions_rows = chosen_idx.clone()
 
     return chosen_tours, chosen_log, actions_rows
